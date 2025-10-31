@@ -1,3 +1,7 @@
 /sketch
 /sam/sam2_ckpts
 /controlNet
+
+*.pth
+*.json
+*.png
