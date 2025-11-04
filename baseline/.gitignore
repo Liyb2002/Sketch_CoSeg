@@ -3,5 +3,3 @@
 /controlNet
 
 *.pth
-*.json
-*.png
