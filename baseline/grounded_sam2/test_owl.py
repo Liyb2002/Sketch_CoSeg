@@ -1,18 +1,23 @@
 #!/usr/bin/env python
 import argparse, json, os
 from pathlib import Path
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Any
 
 import numpy as np
 import torch
 from PIL import Image
 import cv2
 import torchvision
-from transformers import OwlViTProcessor, OwlViTForObjectDetection
+from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
 
-# ------------- utils -------------
-def ensure_dir(p: str | Path): Path(p).mkdir(parents=True, exist_ok=True)
-def slugify(s: str) -> str: return "".join(c.lower() if c.isalnum() else "_" for c in s).strip("_")
+
+# =============== utils ===============
+def ensure_dir(p: str | Path) -> None:
+    Path(p).mkdir(parents=True, exist_ok=True)
+
+def slugify(s: str) -> str:
+    return "".join(c.lower() if c.isalnum() else "_" for c in s).strip("_")
+
 def color_for(lbl: str) -> tuple[int,int,int]:
     rng = np.random.default_rng(abs(hash(lbl)) % (2**32))
     c = rng.integers(50, 220, size=3, dtype=np.int32)
@@ -34,22 +39,30 @@ def draw_boxes(img_bgr: np.ndarray, boxes_xyxy: np.ndarray, label: str,
     return vis
 
 def load_items(json_path: str) -> List[dict]:
+    """
+    Expects:
+      {"components":[{"count":2,"name":"Wheel"}, ...]}
+    Also tolerates legacy {"components":["Wheel","Seat",...]} -> converted to count=99.
+    """
     payload = json.load(open(json_path))
-    items = []
-    for it in payload.get("components", []):
-        if isinstance(it, dict) and "name" in it and "count" in it:
-            name = str(it["name"]).strip()
-            try:
-                cnt = int(it["count"])
-            except Exception:
-                continue
+    comps = payload.get("components", [])
+    items: List[dict] = []
+    if comps and isinstance(comps[0], dict):
+        for it in comps:
+            name = str(it.get("name","")).strip()
+            cnt = int(it.get("count", 0))
             if name and cnt > 0:
                 items.append({"name": name, "count": cnt})
+    else:
+        for name in comps:
+            if isinstance(name, str) and name.strip():
+                items.append({"name": name.strip(), "count": 99})
     if not items:
         raise ValueError("No valid components found in JSON.")
     return items
 
-# ------------- tiling -------------
+
+# =============== tiling ===============
 def gen_tiles(pil_img: Image.Image, grid: int = 3, overlap: float = 0.2):
     W, H = pil_img.size
     tw, th = int(round(W / grid)), int(round(H / grid))
@@ -67,35 +80,37 @@ def remap_boxes(tile_boxes: np.ndarray, tile_xyxy: Tuple[int,int,int,int]) -> np
     out[:,[0,2]] += x0; out[:,[1,3]] += y0
     return out
 
-# ------------- OWL-ViT -------------
+
+# =============== detection via Auto* (OWLv2 / OWL-ViT) ===============
 @torch.no_grad()
-def owlvit_detect_once(
+def detect_once(
     image_pil: Image.Image,
     labels: List[str],
-    model: OwlViTForObjectDetection,
-    processor: OwlViTProcessor,
+    model: Any,
+    processor: Any,
     device: torch.device,
 ):
     inputs = processor(text=labels, images=image_pil, return_tensors="pt").to(device)
     outputs = model(**inputs)
     target_sizes = torch.tensor([image_pil.size[::-1]], device=device)  # (H, W)
     res = processor.post_process_object_detection(outputs=outputs, target_sizes=target_sizes)[0]
-    return (res["boxes"].detach().cpu().numpy().astype(np.float32),
-            res["scores"].detach().cpu().numpy().astype(np.float32),
-            res["labels"].detach().cpu().numpy().astype(np.int64))
+    boxes = res["boxes"].detach().cpu().numpy().astype(np.float32)    # (N,4) xyxy
+    scores = res["scores"].detach().cpu().numpy().astype(np.float32)  # (N,)
+    label_ids = res["labels"].detach().cpu().numpy().astype(np.int64) # (N,)
+    return boxes, scores, label_ids
 
 def pool_per_label(unique_labels: List[str],
                    per_pass_boxes: List[np.ndarray],
                    per_pass_scores: List[np.ndarray],
                    per_pass_label_ids: List[np.ndarray]) -> Dict[str, Tuple[np.ndarray,np.ndarray]]:
-    pooled = {u: ([],[]) for u in unique_labels}
-    for boxes, scores, label_ids in zip(per_pass_boxes, per_pass_scores, per_pass_label_ids):
+    pooled = {u: ([], []) for u in unique_labels}
+    for boxes, scores, lid in zip(per_pass_boxes, per_pass_scores, per_pass_label_ids):
         for i, u in enumerate(unique_labels):
-            sel = (label_ids == i)
+            sel = (lid == i)
             if np.any(sel):
                 pooled[u][0].append(boxes[sel])
                 pooled[u][1].append(scores[sel])
-    out = {}
+    out: Dict[str, Tuple[np.ndarray,np.ndarray]] = {}
     for u in unique_labels:
         bparts, sparts = pooled[u]
         if bparts:
@@ -112,7 +127,7 @@ def nms_topk(boxes: np.ndarray, scores: np.ndarray, iou: float, k: int):
 
 def try_fill_count_with_threshold_sweep(
     boxes: np.ndarray, scores: np.ndarray, need: int, nms_iou: float,
-    sweeps=(0.25, 0.20, 0.15, 0.10, 0.07, 0.05, 0.03, 0.01, 0.0)
+    sweeps=(0.30, 0.25, 0.20, 0.15, 0.10, 0.07, 0.05, 0.03, 0.01, 0.0)
 ) -> Tuple[np.ndarray, np.ndarray, float]:
     order = np.argsort(-scores)
     boxes, scores = boxes[order], scores[order]
@@ -121,9 +136,8 @@ def try_fill_count_with_threshold_sweep(
         b, s = boxes[keep], scores[keep]
         if len(b):
             b2, s2 = nms_topk(b, s, nms_iou, need)
-            if len(b2) >= need:
+            if len(b2) >= min(need, len(b)):
                 return b2[:need], s2[:need], thr
-    # fallback: whatever we have after NMS on loosest thr
     b2, s2 = nms_topk(boxes[scores >= sweeps[-1]], scores[scores >= sweeps[-1]], nms_iou, need)
     return b2, s2, sweeps[-1]
 
@@ -141,15 +155,16 @@ def jitter_duplicates(box: np.ndarray, how_many: int, W: int, H: int) -> np.ndar
         out.append(np.array([jx1, jy1, jx2, jy2], dtype=np.float32))
     return np.stack(out, 0)
 
-# ------------- main -------------
+
+# =============== main ===============
 def main():
-    ap = argparse.ArgumentParser(description="OWL-ViT counted boxes (exact count per component)")
+    ap = argparse.ArgumentParser(description="Counts-aware OWL(V2) detection: exactly 'count' boxes per component")
     ap.add_argument("--image", required=True)
     ap.add_argument("--components_json", required=True)
     ap.add_argument("--out_dir", default="owl_test")
 
-    # default to higher-accuracy model (smaller patch, larger backbone)
-    ap.add_argument("--model_id", default="google/owlvit-large-patch14")
+    # Good default for sketches
+    ap.add_argument("--model_id", default="google/owlv2-large-patch14")
 
     ap.add_argument("--nms_iou", type=float, default=0.5)
     ap.add_argument("--use_tiles", action="store_true")
@@ -160,37 +175,42 @@ def main():
     ensure_dir(args.out_dir)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # image
+    # Image
     image_pil = Image.open(args.image).convert("RGB")
     image_rgb = np.array(image_pil)
     image_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
     H, W = image_rgb.shape[:2]
 
-    # items & unique label list
+    # Items & unique labels
     items = load_items(args.components_json)
-    unique_labels = []
+    unique_labels: List[str] = []
     for it in items:
         if it["name"] not in unique_labels:
             unique_labels.append(it["name"])
 
-    # model
-    processor = OwlViTProcessor.from_pretrained(args.model_id)
-    model = OwlViTForObjectDetection.from_pretrained(args.model_id).to(device).eval()
+    # Model (Auto*, note: OWLv2 needs ZeroShot class)
+    processor = AutoProcessor.from_pretrained(args.model_id)
+    prefer_fp16 = torch.cuda.is_available()
+    model = AutoModelForZeroShotObjectDetection.from_pretrained(
+        args.model_id,
+        dtype=(torch.float16 if prefer_fp16 else None)
+    ).to(device).eval()
 
-    # full image
-    boxes_full, scores_full, lid_full = owlvit_detect_once(image_pil, unique_labels, model, processor, device)
+    # Full image
+    boxes_full, scores_full, lid_full = detect_once(image_pil, unique_labels, model, processor, device)
     all_boxes = [boxes_full]; all_scores = [scores_full]; all_lids = [lid_full]
 
-    # optional tiles
+    # Optional tiles
     if args.use_tiles:
         for tile_pil, tile_xyxy in gen_tiles(image_pil, grid=args.tile_grid, overlap=args.tile_overlap):
-            b, s, lid = owlvit_detect_once(tile_pil, unique_labels, model, processor, device)
+            b, s, lid = detect_once(tile_pil, unique_labels, model, processor, device)
             b = remap_boxes(b, tile_xyxy)
             all_boxes.append(b); all_scores.append(s); all_lids.append(lid)
 
+    # Pool detections per unique label
     pooled = pool_per_label(unique_labels, all_boxes, all_scores, all_lids)
 
-    # select EXACT counts per item
+    # Select EXACT counts per item
     results = []
     combined = image_bgr.copy()
     fallback_notes = []
@@ -200,8 +220,7 @@ def main():
         cand_boxes, cand_scores = pooled.get(name, (np.empty((0,4), np.float32), np.empty((0,), np.float32)))
 
         chosen_boxes, chosen_scores, used_thr = try_fill_count_with_threshold_sweep(
-            cand_boxes, cand_scores, need=count, nms_iou=args.nms_iou,
-            sweeps=(0.25, 0.20, 0.15, 0.10, 0.07, 0.05, 0.03, 0.01, 0.0)
+            cand_boxes, cand_scores, need=count, nms_iou=args.nms_iou
         )
 
         fallback = False
@@ -212,7 +231,7 @@ def main():
                 chosen_scores = np.concatenate([chosen_scores, np.zeros((len(dup),), np.float32)], 0)[:count]
                 fallback = True
             else:
-                # total fallback: center proposals
+                # total fallback: small boxes near center
                 cx, cy = W/2, H/2
                 bw, bh = 0.1*W, 0.1*H
                 base = np.array([cx-bw/2, cy-bh/2, cx+bw/2, cy+bh/2], np.float32)
