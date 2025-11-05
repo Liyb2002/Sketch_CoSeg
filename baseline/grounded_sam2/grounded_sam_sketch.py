@@ -229,3 +229,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+# python grounded_sam_sketch.py   --image 0.png   --components_json components.json   --grounding_model IDEA-Research/grounding-dino-base   --sam_ckpt ./sam_vit_h_4b8939.pth
