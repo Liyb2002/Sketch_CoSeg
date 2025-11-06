@@ -1,7 +1,10 @@
 #!/usr/bin/env python
-# 0.png -> ctrl.png using SDXL + ControlNet (scribble fallback to canny), no prints.
+# Generate multiple photoreal variants from a sketch using SDXL+ControlNet.
+# This module exposes one function: generate_variants(input_path, out_dir, style_prompts, seed).
+# It does NOT hardcode any paths and does not print.
 
 import os, math
+from typing import List
 import numpy as np
 from PIL import Image
 import torch
@@ -25,37 +28,26 @@ try:
 except Exception:
     _CV2_OK = False
 
-# ----- hardcoded IO / models -----
-INPUT_PATH  = "./0.png"
-OUTPUT_PATH = "./ctrl.png"          # saved resized back to the original sketch size
-EDGE_DEBUG  = "./owl_sam_out/edge_debug.png"
-
+# ----- model repo IDs (can stay hardcoded) -----
 REALVIS_ID      = "SG161222/RealVisXL_V5.0"
 SDXL_BASE_ID    = "stabilityai/stable-diffusion-xl-base-1.0"
 SDXL_REFINER_ID = "stabilityai/stable-diffusion-xl-refiner-1.0"
-
 CONTROLNET_IDS = [
     "xinsir/controlnet-scribble-sdxl-1.0",
     "xinsir/controlnet-canny-sdxl-1.0",
     "diffusers/controlnet-canny-sdxl-1.0",
 ]
 
-PROMPT = (
-    "photorealistic motorcycle product photo that matches the sketch silhouette and pose; "
-    "realistic materials (painted metal tank, rubber tires, chrome details), soft studio lighting, "
-    "pure white seamless background, 85mm lens"
-)
+# ----- default negative prompt & knobs (generic) -----
 NEGATIVE = (
     "drawing, lineart, sketch, outline, cartoon, anime, cel shading, pencil, grayscale, "
-    "watermark, text, logo, frame, border, lowres, blurry, noisy background"
+    "text, watermark, logo, frame, border, lowres, blurry, noisy background"
 )
-
-SEED        = 2025
 STEPS       = 50
 GUIDANCE    = 4.5
 CTRL_SCALE  = 0.95
 STRENGTH    = 0.92
-MAX_SIDE    = 1024  # internal generation size; output will be resized back to the sketch size
+MAX_SIDE    = 1024  # internal generation size; output will be resized back to sketch size
 
 # ----- helpers -----
 def _load_and_pad_white(path, max_side=MAX_SIDE):
@@ -86,7 +78,7 @@ def _edges_canny(pil_img, low=80, high=160):
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (3, 3), 0)
     edges = cv2.Canny(gray, low, high)
-    edges_rgb = cv2.cvtColor(255 - edges, cv2.COLOR_GRAY2RGB)
+    edges_rgb = cv2.cvtColor(255 - edges, cv2.COLOR_GRAY2RGB)  # dark edges on white
     return Image.fromarray(edges_rgb)
 
 def _force_white_bg(pil_img, thresh=246):
@@ -106,6 +98,7 @@ def _load_controlnet(dtype):
     raise last
 
 def _build_pipes(device, dtype):
+    # Try RealVis; else SDXL base
     try:
         controlnet = _load_controlnet(dtype)
         pipe = StableDiffusionXLControlNetPipeline.from_pretrained(
@@ -121,26 +114,36 @@ def _build_pipes(device, dtype):
         SDXL_REFINER_ID, torch_dtype=dtype, add_watermarker=False
     ).to(device)
 
-    pipe.enable_attention_slicing()
-    refiner.enable_attention_slicing()
+    pipe.enable_attention_slicing(); refiner.enable_attention_slicing()
     for p in (pipe, refiner):
-        try:
-            p.enable_xformers_memory_efficient_attention()
-        except Exception:
-            pass
+        try: p.enable_xformers_memory_efficient_attention()
+        except Exception: pass
     return pipe, refiner
 
-# ----- public API -----
-def run():
-    if not os.path.exists("./owl_sam_out"):
-        os.makedirs("./owl_sam_out", exist_ok=True)
+def generate_variants(
+    input_path: str,
+    out_dir: str,
+    style_prompts: List[str],
+    seed: int = 2025,
+) -> List[str]:
+    """
+    Args:
+      input_path: path to sketch (e.g., '0.png')
+      out_dir: where to save ctrl_*.png
+      style_prompts: list of positive prompts (each will be used once)
+      seed: base RNG seed
+
+    Returns:
+      List of saved ctrl image paths, in order.
+    """
+    os.makedirs(out_dir, exist_ok=True)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype  = torch.float16 if device == "cuda" else torch.float32
-    gen    = torch.Generator(device=device).manual_seed(SEED)
 
-    init, orig_size = _load_and_pad_white(INPUT_PATH, MAX_SIDE)
+    init, orig_size = _load_and_pad_white(input_path, MAX_SIDE)
 
+    # Edges (prefer HED; fallback Canny; fallback identity)
     if _HED_OK:
         try:
             edges = _edges_hed(init)
@@ -148,36 +151,42 @@ def run():
             edges = _edges_canny(init) if _CV2_OK else init
     else:
         edges = _edges_canny(init) if _CV2_OK else init
-    edges.save(EDGE_DEBUG)
 
     pipe, refiner = _build_pipes(device, dtype)
 
-    out = pipe(
-        prompt=PROMPT,
-        negative_prompt=NEGATIVE,
-        image=init,
-        control_image=edges,
-        controlnet_conditioning_scale=CTRL_SCALE,
-        strength=STRENGTH,
-        num_inference_steps=STEPS,
-        guidance_scale=GUIDANCE,
-        generator=gen,
-    ).images[0]
+    saved = []
+    for i, prompt in enumerate(style_prompts):
+        gen = torch.Generator(device=device).manual_seed(seed + i)
+        out = pipe(
+            prompt=prompt,
+            negative_prompt=NEGATIVE,
+            image=init,
+            control_image=edges,
+            controlnet_conditioning_scale=CTRL_SCALE,
+            strength=STRENGTH,
+            num_inference_steps=STEPS,
+            guidance_scale=GUIDANCE,
+            generator=gen,
+        ).images[0]
 
-    refined = refiner(
-        prompt=PROMPT, negative_prompt=NEGATIVE,
-        image=out, strength=0.25,
-        num_inference_steps=20, guidance_scale=5.0,
-        generator=gen,
-    ).images[0]
+        refined = refiner(
+            prompt=prompt, negative_prompt=NEGATIVE,
+            image=out, strength=0.25,
+            num_inference_steps=20, guidance_scale=5.0,
+            generator=gen,
+        ).images[0]
 
-    final_img = _force_white_bg(refined).resize(orig_size, Image.LANCZOS)
-    final_img.save(OUTPUT_PATH)
+        final_img = _force_white_bg(refined).resize(orig_size, Image.LANCZOS)
+        out_path = os.path.join(out_dir, f"ctrl_{i}.png")
+        final_img.save(out_path)
+        saved.append(out_path)
 
-    
+    # Free VRAM
+    try:
+        pipe.to("cpu"); refiner.to("cpu")
+        del pipe, refiner
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
 
-def main():
-    run()
-
-if __name__ == "__main__":
-    main()
+    return saved

@@ -1,50 +1,31 @@
 #!/usr/bin/env python
-# Hard-coded pipeline:
-#   0) make_realistic: 0.png -> ctrl.png (photoreal)
-#   1) OWLv2+SAM on ctrl.png, APPLY masks to original 0.png  -> owl_sam_out/realism/
-#   2) OWLv2+SAM on 0.png,   APPLY masks to original 0.png  -> owl_sam_out/sketch/
-# Only prints two summary lines at the very end.
+# Orchestrator for: realism generation -> OWL-V2 detection -> SAM masks per variant -> union.
+# Prints only the detection count per ctrl_x.png.
 
-import io, os, sys, json
-from contextlib import redirect_stdout, redirect_stderr
+import os, re, json
 from pathlib import Path
-from typing import List, Dict, Any
-
+from typing import Dict, Any, List
 import numpy as np
 from PIL import Image
 import cv2
 import torch
 
+# your baseline detector (DO NOT MODIFY)
 from owl import detect_owlv2_boxes_counts
+
+# your SAM wrapper (we'll use SamRunner directly)
 from sam import SamRunner
-import make_realistic
 
-# ----- hard-coded IO -----
-IMAGE_PATH   = "./0.png"
-REAL_PATH    = "./ctrl.png"           # produced by make_realistic
-COMP_JSON    = "./components.json"
-SAM_CKPT     = "./sam_vit_h_4b8939.pth"
+# new helpers we added earlier
+from make_realistic import generate_variants
+from combine_masks import combine_all
 
-OUT_ROOT     = "./owl_sam_out"
-OUT_REALISM  = "./owl_sam_out/realism"
-OUT_SKETCH   = "./owl_sam_out/sketch"
+# ---------------- utils ----------------
+def _slug(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", s.strip().lower()).strip("_")
 
-RUN1_PREFIX  = "realism"              # labels for filenames
-RUN2_PREFIX  = "sketch"
-
-MODEL_ID     = "google/owlv2-large-patch14"
-USE_TILES    = True
-TILE_GRID    = 3
-TILE_OVERLAP = 0.2
-NMS_IOU      = 0.5
-THR_SWEEP    = [0.30,0.25,0.20,0.15,0.10,0.07,0.05,0.03,0.01,0.0]
-
-# ----- tiny utils -----
-def ensure_dir(p: str | Path) -> None:
-    Path(p).mkdir(parents=True, exist_ok=True)
-
-def load_items(json_path: str) -> List[Dict[str, Any]]:
-    payload = json.load(open(json_path))
+def _load_items(components_json: str) -> List[Dict[str, Any]]:
+    payload = json.load(open(components_json, "r"))
     comps = payload.get("components", [])
     items: List[Dict[str, Any]] = []
     if comps and isinstance(comps[0], dict):
@@ -58,134 +39,134 @@ def load_items(json_path: str) -> List[Dict[str, Any]]:
                 items.append({"name": n.strip(), "count": 1})
     return items
 
-def slugify(s: str) -> str:
-    return "".join(c.lower() if c.isalnum() else "_" for c in s).strip("_")
-
-def color_for(lbl: str) -> tuple[int,int,int]:
+def _color_for(lbl: str) -> tuple[int,int,int]:
+    # BGR for cv2 overlays
     rng = np.random.default_rng(abs(hash(lbl)) % (2**32))
     c = rng.integers(50, 220, size=3, dtype=np.int32)
-    return (int(c[0]), int(c[1]), int(c[2]))  # BGR
+    return int(c[2]), int(c[1]), int(c[0])
 
-def save_mask_png(mask_bool: np.ndarray, out_path: str) -> None:
+def _save_mask_png(mask_bool: np.ndarray, out_path: str):
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     cv2.imwrite(out_path, (mask_bool.astype(np.uint8) * 255))
 
-def overlay_mask(image_bgr: np.ndarray, mask_bool: np.ndarray, bgr_color: tuple[int,int,int]) -> np.ndarray:
-    out = image_bgr.copy().astype(np.float32)
-    col = np.array(bgr_color, np.float32)
-    out[mask_bool] = 0.6 * out[mask_bool] + 0.4 * col
-    return np.clip(out, 0, 255).astype(np.uint8)
+# ---------------- main pipeline ----------------
+def main():
+    # ---- paths (only here) ----
+    sketch_path       = "0.png"
+    components_json   = "components.json"
+    base_out_dir      = "owl_sam_output"
+    realism_img_dir   = os.path.join(base_out_dir, "realism_imgs")
+    Path(base_out_dir).mkdir(parents=True, exist_ok=True)
+    Path(realism_img_dir).mkdir(parents=True, exist_ok=True)
 
-def save_global_overlay(image_bgr: np.ndarray, masks: List[np.ndarray | None], labels: List[str], out_path: str) -> None:
-    overlay = image_bgr.copy().astype(np.float32)
-    for m, lbl in zip(masks, labels):
-        if m is None: continue
-        col = np.array(color_for(lbl), np.float32)
-        overlay[m] = 0.6 * overlay[m] + 0.4 * col
-    overlay = np.clip(overlay, 0, 255).astype(np.uint8)
-    y = 24
-    for lbl in labels:
-        col = color_for(lbl)
-        cv2.rectangle(overlay, (10, y - 15), (30, y + 5), col, -1)
-        cv2.putText(overlay, lbl, (40, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (240,240,240), 1, cv2.LINE_AA)
-        y += 22
-    cv2.imwrite(out_path, overlay)
+    # ---- multi-style prompts (domain-agnostic) ----
+    styles = [
+        "photorealistic product photo of the object matching the sketch silhouette and pose,pure white background "
+        "realistic materials, soft studio lighting, pure white seamless background, 85mm lens, pure white background",
+        "cyberpunk style object matching the sketch silhouette and pose, neon accents, moody city light, pure white background"
+        "professional render, on pure white background",
+        "vintage WWII era style object matching the sketch silhouette and pose, brushed metal, worn paint, pure white background"
+        "studio lighting, on pure white background",
+        "futuristic minimal industrial design object matching the sketch silhouette and pose, pure white background"
+        "brushed aluminum, diffuse softbox lighting, pure white background",
+        "rusty, weathered, old industrial object matching the sketch silhouette and pose, pure white background"
+        "subtle shadows, studio lighting, pure white background",
+    ]
 
-class _Silence:
-    def __enter__(self):
-        self._null = io.StringIO()
-        self._stdout_cm = redirect_stdout(self._null)
-        self._stderr_cm = redirect_stderr(self._null)
-        self._stdout_cm.__enter__()
-        self._stderr_cm.__enter__()
-        return self
-    def __exit__(self, exc_type, exc, tb):
-        self._stderr_cm.__exit__(exc_type, exc, tb)
-        self._stdout_cm.__exit__(exc_type, exc, tb)
+    # ---- 1) generate ctrl_* variants ----
+    print("--------------------generate_variant realistic images--------------------")
+    ctrl_paths = generate_variants(
+        input_path=sketch_path,
+        out_dir=realism_img_dir,
+        style_prompts=styles,
+        seed=2025,
+    )
 
-# ----- detection + masks -----
-def _owl_sam_once_for_image(
-    det_pil: Image.Image,
-    apply_bgr: np.ndarray,
-    items: List[Dict[str,Any]],
-    out_dir: str,
-    prefix: str,
-    sam_ckpt: str
-) -> int:
-    """
-    det_pil: PIL RGB used for OWL detection
-    apply_bgr: BGR image to APPLY masks to (the original sketch)
-    Returns: number of components with >=1 detected box
-    """
-    H, W = apply_bgr.shape[:2]
-    labels = [it["name"] for it in items]
+    # free VRAM between steps
+    try:
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
 
-    with _Silence():
+    # ---- 2) OWL detect + SAM masks per ctrl_i ----
+    items = _load_items(components_json)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # prepare SAM once (you can change type/ckpt here)
+    sam_type = "vit_h"
+    sam_ckpt = "./sam_vit_h_4b8939.pth"
+    sam_runner = SamRunner(sam_type=sam_type, sam_ckpt=sam_ckpt, device=device)
+    sam_runner.set_sketch(sketch_rgb) 
+
+    for p in ctrl_paths:
+        sub = Path(base_out_dir) / Path(p).stem              # owl_sam_output/ctrl_0
+        sub.mkdir(parents=True, exist_ok=True)
+
+        # --- OWL on this ctrl image ---
+        img = Image.open(p).convert("RGB")
         results = detect_owlv2_boxes_counts(
-            image_pil=det_pil,
+            image_pil=img,
             items=items,
-            model_id=MODEL_ID
+            model_id="google/owlv2-large-patch14",
+            use_tiles=True,
+            tile_grid=3,
+            tile_overlap=0.2,
+            nms_iou=0.5,
+            score_thresholds=(0.30,0.25,0.20,0.15,0.10,0.07,0.05,0.03,0.01,0.0),
+            enforce_no_overlap=False,
         )
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    samr = SamRunner(sam_type="vit_h", sam_ckpt=sam_ckpt, device=device)
-    # SAM should see the same image we will overlay onto (the sketch), so masks align 1:1
-    samr.set_image(cv2.cvtColor(apply_bgr, cv2.COLOR_BGR2RGB))
+        # ---- print detection count for this ctrl_x.png ----
+        det_count = sum(len(v["boxes"]) for v in results.values())
+        print(f"{Path(p).stem}: {det_count} detections")
 
-    masks_list = []
-    for it in items:
-        nm = it["name"]
-        entry = results.get(nm, {"boxes": np.empty((0,4), np.float32)})
-        boxes = entry["boxes"]
-        merged = None
-        for b in boxes:
-            m = samr.mask_from_box(b, (H, W))
-            merged = m if merged is None else (merged | m)
-        masks_list.append(merged if merged is not None else None)
+        # --- SAM on this ctrl image (box → mask) ---
+        rgb = np.array(img)
+        bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        H, W = rgb.shape[:2]
+        sam_runner.set_image(rgb)
 
-    # per-component artifacts
-    for it, m in zip(items, masks_list):
-        nm = it["name"]; slug = slugify(nm)
-        if m is None: continue
-        save_mask_png(m, os.path.join(out_dir, f"{prefix}_{slug}_mask.png"))
-        ov = overlay_mask(apply_bgr, m, color_for(nm))
-        cv2.imwrite(os.path.join(out_dir, f"{prefix}_{slug}_overlay.png"), ov)
+        # merged overlay across all labels for this variant
+        overlay = bgr.copy().astype(np.float32)
 
-    # global overlay
-    save_global_overlay(apply_bgr, masks_list, labels, os.path.join(out_dir, f"{prefix}_overlay.png"))
+        for it in items:
+            label = it["name"]
+            slug  = _slug(label)
+            boxes = results.get(label, {}).get("boxes", np.empty((0,4), np.float32))
 
-    # count how many components got >= 1 box
-    detected = sum(1 for it in items if len(results.get(it["name"], {}).get("boxes", [])) >= 1)
-    return detected
+            if boxes is None or len(boxes) == 0:
+                # still save an empty mask for consistency
+                empty = np.zeros((H, W), dtype=bool)
+                _save_mask_png(empty, str(sub / f"{slug}_mask.png"))
+                continue
 
-def main():
-    # folders
-    ensure_dir(OUT_ROOT)
-    ensure_dir(OUT_REALISM)
-    ensure_dir(OUT_SKETCH)
+            # merge multiple boxes for the same label
+            merged = np.zeros((H, W), dtype=bool)
+            for bx in boxes:
+                mask = sam_runner.mask_from_box(np.asarray(bx, np.float32), (H, W))
+                merged |= mask
 
-    # 0) make photoreal ctrl.png (quiet)
-    with _Silence():
-        make_realistic.run()
+            # save merged mask
+            _save_mask_png(merged, str(sub / f"{slug}_mask.png"))
 
+            # draw on overlay
+            col = np.array(_color_for(label), np.float32)
+            idx = merged
+            overlay[idx] = 0.6 * overlay[idx] + 0.4 * col
 
-    # load images
-    sketch_rgb = np.array(Image.open(IMAGE_PATH).convert("RGB"))
-    sketch_bgr = cv2.cvtColor(sketch_rgb, cv2.COLOR_RGB2BGR)
-    ctrl_pil   = Image.open(REAL_PATH).convert("RGB")   # same size as sketch
-    sketch_pil = Image.open(IMAGE_PATH).convert("RGB")
+        overlay = np.clip(overlay, 0, 255).astype(np.uint8)
+        cv2.imwrite(str(sub / "overlay.png"), overlay)
 
-    items = load_items(COMP_JSON)
-    total = len(items)
-
-    # 1) OWL+SAM on ctrl.png (apply masks to sketch) -> owl_sam_out/realism
-    det_real = _owl_sam_once_for_image(ctrl_pil, sketch_bgr, items, OUT_REALISM, RUN1_PREFIX, SAM_CKPT)
-
-    # 2) OWL+SAM on 0.png (apply masks to sketch) -> owl_sam_out/sketch
-    det_skch = _owl_sam_once_for_image(sketch_pil, sketch_bgr, items, OUT_SKETCH, RUN2_PREFIX, SAM_CKPT)
-
-    # Final, minimal prints:
-    print(f"OWL-Det (realism): {det_real} / {total}")
-    print(f"OWL-Det (sketch): {det_skch} / {total}")
+    # ---- 3) union across ctrl_* into final_output on original sketch ----
+    combine_all(
+        base_out_dir=base_out_dir,
+        components_json=components_json,
+        original_image_path=sketch_path,
+    )
 
 if __name__ == "__main__":
     main()
