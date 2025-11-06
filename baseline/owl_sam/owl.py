@@ -157,7 +157,9 @@ def detect_owlv2_boxes_counts(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     processor = AutoProcessor.from_pretrained(model_id)
     model = AutoModelForZeroShotObjectDetection.from_pretrained(
-        model_id, dtype=(torch.float16 if torch.cuda.is_available() else None)
+        model_id,
+        torch_dtype=(torch.float16 if torch.cuda.is_available() else None),
+        low_cpu_mem_usage=True,
     ).to(device).eval()
 
     # full image
