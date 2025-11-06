@@ -174,6 +174,8 @@ def run():
     final_img = _force_white_bg(refined).resize(orig_size, Image.LANCZOS)
     final_img.save(OUTPUT_PATH)
 
+    
+
 def main():
     run()
 

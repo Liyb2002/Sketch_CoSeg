@@ -123,13 +123,7 @@ def _owl_sam_once_for_image(
         results = detect_owlv2_boxes_counts(
             image_pil=det_pil,
             items=items,
-            model_id=MODEL_ID,
-            use_tiles=USE_TILES,
-            tile_grid=TILE_GRID,
-            tile_overlap=TILE_OVERLAP,
-            nms_iou=NMS_IOU,
-            score_thresholds=THR_SWEEP,
-            enforce_no_overlap=True,
+            model_id=MODEL_ID
         )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -172,6 +166,7 @@ def main():
     # 0) make photoreal ctrl.png (quiet)
     with _Silence():
         make_realistic.run()
+
 
     # load images
     sketch_rgb = np.array(Image.open(IMAGE_PATH).convert("RGB"))

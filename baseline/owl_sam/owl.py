@@ -151,9 +151,16 @@ def detect_owlv2_boxes_counts(
     tile_overlap: float = 0.2,
     nms_iou: float = 0.5,
     score_thresholds: List[float] = (0.30,0.25,0.20,0.15,0.10,0.07,0.05,0.03,0.01,0.0),
-    enforce_no_overlap: bool = True,
+    enforce_no_overlap: bool = False,         # <- match the “good” script
 ) -> Dict[str, Dict[str, np.ndarray]]:
-    labels = [it["name"] for it in items]
+    # --- unique labels (critical) ---
+    unique_labels: List[str] = []
+    for it in items:
+        nm = str(it["name"])
+        if nm not in unique_labels:
+            unique_labels.append(nm)
+
+    # --- model ---
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     processor = AutoProcessor.from_pretrained(model_id)
     model = AutoModelForZeroShotObjectDetection.from_pretrained(
@@ -162,28 +169,35 @@ def detect_owlv2_boxes_counts(
         low_cpu_mem_usage=True,
     ).to(device).eval()
 
-    # full image
-    b_full, s_full, lid_full = _detect_once(image_pil, labels, model, processor, device)
+    # --- full image pass ---
+    b_full, s_full, lid_full = _detect_once(image_pil, unique_labels, model, processor, device)
     per_boxes = [b_full]; per_scores = [s_full]; per_lids = [lid_full]
 
-    # tiles
+    # --- tiles (optional) ---
     if use_tiles:
         for tile_pil, tile_xyxy in _gen_tiles(image_pil, tile_grid, tile_overlap):
-            b, s, lid = _detect_once(tile_pil, labels, model, processor, device)
-            b = _remap_boxes(b, tile_xyxy)
-            per_boxes.append(b); per_scores.append(s); per_lids.append(lid)
+            b, s, lid = _detect_once(tile_pil, unique_labels, model, processor, device)
+            per_boxes.append(_remap_boxes(b, tile_xyxy)); per_scores.append(s); per_lids.append(lid)
 
-    pooled = _pool_candidates(labels, per_boxes, per_scores, per_lids)
-    results = _select_counts_no_overlap(items, pooled, nms_iou, list(score_thresholds), enforce_no_overlap)
+    # --- pool strictly by index into unique_labels ---
+    pooled = _pool_candidates(unique_labels, per_boxes, per_scores, per_lids)
 
-    # ---- summary print ----
+    # --- per-item exact-count selection (uses your existing selection logic) ---
+    results = _select_counts_no_overlap(
+        items=items,
+        pooled=pooled,                   # dict[name] -> (boxes, scores)
+        nms_iou=nms_iou,
+        score_thresholds=list(score_thresholds),
+        enforce_no_overlap=enforce_no_overlap,
+    )
+
+    # --- tiny summary ---
     total = len(items)
     ok_names = [nm for nm, v in results.items() if len(v["boxes"]) >= 1]
     miss_names = [it["name"] for it in items if len(results[it["name"]]["boxes"]) == 0]
     print(f"[OWL] detected {len(ok_names)} / {total} components with >=1 box.")
     if miss_names:
         print("[OWL] not detected:", ", ".join(miss_names))
-
     return results
 
 # ------------- CLI: writes visualization -------------
@@ -218,9 +232,7 @@ if __name__ == "__main__":
 
     img = Image.open(args.image).convert("RGB")
     res = detect_owlv2_boxes_counts(
-        image_pil=img, items=items, model_id=args.model_id,
-        use_tiles=args.use_tiles, tile_grid=args.tile_grid, tile_overlap=args.tile_overlap,
-        enforce_no_overlap=True
+        image_pil=img, items=items, model_id=args.model_id
     )
 
     # visualization
