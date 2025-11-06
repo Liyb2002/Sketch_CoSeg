@@ -268,3 +268,8 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+# python test_owl.py   --image 0.png   --components_json components.json   --out_dir owl_test   --model_id google/owlv2-large-patch14   --use_tiles --tile_grid 3 --tile_overlap 0.2
+

@@ -1,15 +1,16 @@
 #!/usr/bin/env python
-# Runs OWLv2 -> SAM on a sketch with hard-coded inputs.
+# Runs OWLv2 -> SAM with hard-coded inputs and saves masks + overlays.
 
 import os, json
 from pathlib import Path
+from typing import List, Dict, Any
 from PIL import Image
 import numpy as np
 import cv2
 import torch
 
-from owl import detect_owlv2_boxes   # local
-from sam import SamRunner            # local
+from owl import detect_owlv2_boxes_counts  # local
+from sam import SamRunner                  # local
 
 # ---------- hard-coded IO ----------
 IMAGE_PATH = "./1.png"
@@ -17,38 +18,51 @@ COMP_JSON  = "./components.json"
 SAM_CKPT   = "./sam_vit_h_4b8939.pth"
 OUT_DIR    = "./owl_sam_out"
 
-# ---------- small utils ----------
+# ---------- utils ----------
 def ensure_dir(p: str | Path) -> None:
     Path(p).mkdir(parents=True, exist_ok=True)
 
-def load_component_names(json_path: str) -> list[str]:
+def load_items(json_path: str) -> List[Dict[str, Any]]:
+    """
+    Accepts:
+      {"components":[{"count":2,"name":"Wheel"}, ...]}
+      or legacy {"components":["Wheel","Seat",...]} -> converts to count=1 each.
+    """
     payload = json.load(open(json_path))
     comps = payload.get("components", [])
-    names = []
-    for it in comps:
-        if isinstance(it, str):
-            n = it.strip()
-            if n: names.append(n)
-        elif isinstance(it, dict):
-            n = str(it.get("name", "")).strip()
-            if n: names.append(n)
-    # keep order, dedupe
-    dedup = []
-    for n in names:
-        if n not in dedup:
-            dedup.append(n)
-    return dedup
+    items: List[Dict[str, Any]] = []
+    if comps and isinstance(comps[0], dict):
+        for it in comps:
+            name = str(it.get("name","")).strip()
+            cnt = int(it.get("count", 1))
+            if name and cnt >= 1:
+                items.append({"name": name, "count": cnt})
+    else:
+        for name in comps:
+            if isinstance(name, str) and name.strip():
+                items.append({"name": name.strip(), "count": 1})
+    if not items:
+        raise ValueError("No valid components found in JSON.")
+    return items
+
+def slugify(s: str) -> str:
+    return "".join(c.lower() if c.isalnum() else "_" for c in s).strip("_")
+
+def color_for(lbl: str) -> tuple[int,int,int]:
+    rng = np.random.default_rng(abs(hash(lbl)) % (2**32))
+    c = rng.integers(50, 220, size=3, dtype=np.int32)
+    return (int(c[0]), int(c[1]), int(c[2]))  # BGR
 
 def save_mask_png(mask_bool: np.ndarray, out_path: str) -> None:
     cv2.imwrite(out_path, (mask_bool.astype(np.uint8) * 255))
 
-def color_for(lbl: str) -> tuple[int,int,int]:
-    # deterministic BGR
-    rng = np.random.default_rng(abs(hash(lbl)) % (2**32))
-    c = rng.integers(50, 220, size=3, dtype=np.int32)
-    return (int(c[0]), int(c[1]), int(c[2]))
+def overlay_one(image_bgr: np.ndarray, mask_bool: np.ndarray, bgr_color: tuple[int,int,int]) -> np.ndarray:
+    out = image_bgr.copy().astype(np.float32)
+    col = np.array(bgr_color, np.float32)
+    out[mask_bool] = 0.6 * out[mask_bool] + 0.4 * col
+    return np.clip(out, 0, 255).astype(np.uint8)
 
-def save_overlay(image_bgr: np.ndarray, masks: list[np.ndarray | None], labels: list[str], out_path: str) -> None:
+def save_global_overlay(image_bgr: np.ndarray, masks: List[np.ndarray | None], labels: List[str], out_path: str) -> None:
     overlay = image_bgr.copy().astype(np.float32)
     for m, lbl in zip(masks, labels):
         if m is None: continue
@@ -56,7 +70,7 @@ def save_overlay(image_bgr: np.ndarray, masks: list[np.ndarray | None], labels: 
         overlay[m] = 0.6 * overlay[m] + 0.4 * col
     overlay = np.clip(overlay, 0, 255).astype(np.uint8)
 
-    # quick legend
+    # legend
     y = 24
     for lbl in labels:
         col = color_for(lbl)
@@ -69,76 +83,64 @@ def save_overlay(image_bgr: np.ndarray, masks: list[np.ndarray | None], labels: 
 def main():
     ensure_dir(OUT_DIR)
 
-    # Load image (RGB for models, BGR for OpenCV)
     image_pil = Image.open(IMAGE_PATH).convert("RGB")
     image_rgb = np.array(image_pil)
     image_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
     H, W = image_rgb.shape[:2]
 
-    # Load labels
-    labels = load_component_names(COMP_JSON)
-    print(f"[INFO] Components: {labels}")
+    items = load_items(COMP_JSON)  # [{name,count}, ...]
+    labels = [it["name"] for it in items]
+    print(f"[INFO] Components: {items}")
 
-    # ---- OWLv2: get boxes per label (variable count, best-effort) ----
-    # You can tweak model_id / tiling defaults here if you want.
-    owl_results = detect_owlv2_boxes(
+    # ---- OWLv2 (counts + global non-overlap) ----
+    results = detect_owlv2_boxes_counts(
         image_pil=image_pil,
-        labels=labels,
+        items=items,
         model_id="google/owlv2-large-patch14",
         use_tiles=True,
         tile_grid=3,
         tile_overlap=0.2,
-        nms_iou=0.5,
-        score_thresholds=[0.30, 0.25, 0.20, 0.15, 0.10, 0.07, 0.05, 0.03, 0.01, 0.0],
-        max_per_label=5,
+        nms_iou=0.5,                    # NMS for candidate pooling
+        score_thresholds=[0.30,0.25,0.20,0.15,0.10,0.07,0.05,0.03,0.01,0.0],
+        enforce_no_overlap=True,        # global non-overlap constraint
     )
-    # owl_results: dict {label: {"boxes": (K,4) float32, "scores": (K,), "thr": float}}
+    # results: dict name -> {"boxes": (k,4), "scores": (k,), "thr": float}
 
-    # ---- SAM: convert boxes -> masks ----
+    # ---- SAM: boxes -> masks (per component) ----
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     samr = SamRunner(sam_type="vit_h", sam_ckpt=SAM_CKPT, device=device)
     samr.set_image(image_rgb)
 
-    masks_per_label: list[np.ndarray | None] = []
-    manifest = {"items": []}
-
-    for lbl in labels:
-        entry = owl_results.get(lbl, {"boxes": np.empty((0,4), np.float32), "scores": np.empty((0,), np.float32), "thr": None})
+    masks_list: List[np.ndarray | None] = []
+    for it in items:
+        name = it["name"]
+        entry = results.get(name, {"boxes": np.empty((0,4), np.float32), "scores": np.empty((0,), np.float32)})
         boxes = entry["boxes"]
-        scores = entry["scores"]
-
         merged = None
         for b in boxes:
-            m_best = samr.mask_from_box(b, (H, W))  # bool HxW
-            if merged is None:
-                merged = m_best.copy()
-            else:
-                merged |= m_best
+            m_best = samr.mask_from_box(b, (H, W))
+            merged = m_best if merged is None else (merged | m_best)
 
+        # save per-component mask + overlay
         if merged is None:
-            masks_per_label.append(None)
-            manifest["items"].append({
-                "name": lbl, "boxes_xyxy": [], "scores": [], "mask_path": None
-            })
+            masks_list.append(None)
         else:
-            masks_per_label.append(merged)
-            slug = "".join(c.lower() if c.isalnum() else "_" for c in lbl).strip("_")
+            masks_list.append(merged)
+            slug = slugify(name)
             mask_path = os.path.join(OUT_DIR, f"{slug}_mask.png")
             save_mask_png(merged, mask_path)
-            manifest["items"].append({
-                "name": lbl,
-                "boxes_xyxy": boxes.tolist(),
-                "scores": scores.tolist(),
-                "mask_path": mask_path
-            })
 
-    # Save overlay
-    overlay_path = os.path.join(OUT_DIR, "overlay.png")
-    save_overlay(image_bgr, masks_per_label, labels, overlay_path)
-    json.dump(manifest, open(os.path.join(OUT_DIR, "results.json"), "w"), indent=2)
+            per_overlay = overlay_one(image_bgr, merged, color_for(name))
+            cv2.imwrite(os.path.join(OUT_DIR, f"{slug}_overlay.png"), per_overlay)
 
-    print(f"[OK] Wrote masks + overlay to {OUT_DIR}")
-    print(f"      overlay: {overlay_path}")
+    # save global overlay
+    save_global_overlay(image_bgr, masks_list, labels, os.path.join(OUT_DIR, "overlay.png"))
+    json.dump(
+        {"items": items, "results": {k: {"boxes": v["boxes"].tolist(), "scores": v["scores"].tolist()} for k,v in results.items()}},
+        open(os.path.join(OUT_DIR, "results.json"), "w"),
+        indent=2
+    )
+    print(f"[OK] wrote masks + overlays to {OUT_DIR}")
 
 if __name__ == "__main__":
     main()
