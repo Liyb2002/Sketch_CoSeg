@@ -3,3 +3,9 @@
 /controlNet
 
 *.pth
+/grounded_sam2/masks_out
+/grounded_sam2/dino_test
+/grounded_sam2/owl_test
+
+/owl_sam/owl_sam_output
+/owl_sam/owl_sam_out
