@@ -43,11 +43,19 @@ def _color_for(lbl: str) -> tuple[int,int,int]:
     # BGR for cv2 overlays
     rng = np.random.default_rng(abs(hash(lbl)) % (2**32))
     c = rng.integers(50, 220, size=3, dtype=np.int32)
+    # return as BGR
     return int(c[2]), int(c[1]), int(c[0])
 
 def _save_mask_png(mask_bool: np.ndarray, out_path: str):
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     cv2.imwrite(out_path, (mask_bool.astype(np.uint8) * 255))
+
+def _overlay_faded(base_bgr: np.ndarray, mask_bool: np.ndarray, color_bgr: tuple[int,int,int]) -> np.ndarray:
+    """50% faded background + 40% color on masked pixels."""
+    out = (base_bgr.astype(np.float32) * 0.5)
+    col = np.array(color_bgr, np.float32)
+    out[mask_bool] = 0.6 * out[mask_bool] + 0.4 * col
+    return np.clip(out, 0, 255).astype(np.uint8)
 
 # ---------------- main pipeline ----------------
 def main():
@@ -61,16 +69,11 @@ def main():
 
     # ---- multi-style prompts (domain-agnostic) ----
     styles = [
-        "photorealistic product photo of the object matching the sketch silhouette and pose,pure white background "
-        "realistic materials, soft studio lighting, pure white seamless background, 85mm lens, pure white background",
-        "cyberpunk style object matching the sketch silhouette and pose, neon accents, moody city light, pure white background"
-        "professional render, on pure white background",
-        "vintage WWII era style object matching the sketch silhouette and pose, brushed metal, worn paint, pure white background"
-        "studio lighting, on pure white background",
-        "futuristic minimal industrial design object matching the sketch silhouette and pose, pure white background"
-        "brushed aluminum, diffuse softbox lighting, pure white background",
-        "rusty, weathered, old industrial object matching the sketch silhouette and pose, pure white background"
-        "subtle shadows, studio lighting, pure white background",
+        "photorealistic product photo of the object matching the sketch silhouette and pose, realistic materials, soft studio lighting, pure white seamless background, 85mm lens",
+        "cyberpunk style object matching the sketch silhouette and pose, neon accents, moody city lights, pure white background, professional render",
+        "vintage WWII era object matching the sketch silhouette and pose, brushed metal, worn paint, studio lighting, pure white background",
+        "futuristic minimal industrial design matching the sketch silhouette and pose, brushed aluminum, diffuse softbox lighting, pure white background",
+        "rusty weathered old industrial object matching the sketch silhouette and pose, subtle shadows, studio lighting, pure white background",
     ]
 
     # ---- 1) generate ctrl_* variants ----
@@ -96,11 +99,16 @@ def main():
     items = _load_items(components_json)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    # load sketch once (RGB/BGR) and keep for overlays
+    sketch_rgb = np.array(Image.open(sketch_path).convert("RGB"))
+    sketch_bgr_full = cv2.cvtColor(sketch_rgb, cv2.COLOR_RGB2BGR)
+
     # prepare SAM once (you can change type/ckpt here)
     sam_type = "vit_h"
     sam_ckpt = "./sam_vit_h_4b8939.pth"
     sam_runner = SamRunner(sam_type=sam_type, sam_ckpt=sam_ckpt, device=device)
-    sam_runner.set_sketch(sketch_rgb) 
+    # let SamRunner know the sketch for overlay_sketch.png writes later
+    sam_runner.set_sketch(sketch_rgb)
 
     for p in ctrl_paths:
         sub = Path(base_out_dir) / Path(p).stem              # owl_sam_output/ctrl_0
@@ -130,8 +138,15 @@ def main():
         H, W = rgb.shape[:2]
         sam_runner.set_image(rgb)
 
-        # merged overlay across all labels for this variant
-        overlay = bgr.copy().astype(np.float32)
+        # prepare a sketch base (resize to ctrl size if needed) for per-variant overlay
+        if sketch_bgr_full.shape[:2] != (H, W):
+            sketch_bgr = cv2.resize(sketch_bgr_full, (W, H), interpolation=cv2.INTER_LINEAR)
+        else:
+            sketch_bgr = sketch_bgr_full.copy()
+
+        # merged overlays across all labels for this variant
+        overlay_ctrl = bgr.astype(np.float32)          
+        overlay_skch = sketch_bgr.astype(np.float32)
 
         for it in items:
             label = it["name"]
@@ -153,13 +168,14 @@ def main():
             # save merged mask
             _save_mask_png(merged, str(sub / f"{slug}_mask.png"))
 
-            # draw on overlay
-            col = np.array(_color_for(label), np.float32)
-            idx = merged
-            overlay[idx] = 0.6 * overlay[idx] + 0.4 * col
+            # draw on both overlays with same color
+            overlay_ctrl[merged] = bgr[merged]
+            overlay_skch[merged] = sketch_bgr[merged]
 
-        overlay = np.clip(overlay, 0, 255).astype(np.uint8)
-        cv2.imwrite(str(sub / "overlay.png"), overlay)
+        overlay_ctrl = np.clip(overlay_ctrl, 0, 255).astype(np.uint8)
+        overlay_skch = np.clip(overlay_skch, 0, 255).astype(np.uint8)
+        cv2.imwrite(str(sub / "overlay_ctrl.png"), overlay_ctrl)
+        cv2.imwrite(str(sub / "overlay_sketch.png"), overlay_skch)
 
     # ---- 3) union across ctrl_* into final_output on original sketch ----
     combine_all(

@@ -35,12 +35,34 @@ class SamRunner:
         best = int(torch.argmax(ious[0]).item())
         return masks[0, best].detach().cpu().numpy().astype(bool)
 
-    def overlay_mask(self, base_bgr: np.ndarray, mask: np.ndarray, color=(60, 180, 60)) -> np.ndarray:
-        """Overlay mask with 50% faded background and 40% green tint."""
-        faded = (base_bgr.astype(np.float32) * 0.5)  # 50% opacity background
+    def overlay_mask(self, base_bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
+        """
+        Overlay the mask on the original image without color tint.
+        The background is slightly faded for clarity, masked region stays fully bright.
+        """
+        faded = (base_bgr.astype(np.float32) * 0.5)  # fade background 50%
         overlay = faded.copy()
-        overlay[mask] = 0.6 * overlay[mask] + 0.4 * np.array(color, np.float32)
+        overlay[mask] = base_bgr[mask]  # keep original color where mask is True
         return np.clip(overlay, 0, 255).astype(np.uint8)
+
+
+    def set_sketch(self, sketch_rgb: Optional[np.ndarray] = None, path: Optional[str] = None):
+        """
+        Set/replace the sketch used for overlays.
+        - Provide either an RGB ndarray via `sketch_rgb`
+          or a file path via `path`.
+        - Pass None to clear.
+        """
+        if path is not None:
+            p = Path(path)
+            if not p.exists():
+                raise FileNotFoundError(f"Sketch path not found: {path}")
+            sketch_rgb = np.array(Image.open(p).convert("RGB"))
+
+        if sketch_rgb is None:
+            self.sketch_bgr = None
+        else:
+            self.sketch_bgr = cv2.cvtColor(sketch_rgb, cv2.COLOR_RGB2BGR)
 
 # -------- CLI: overlays (single box) + keeps overlay.png --------
 if __name__ == "__main__":
@@ -77,7 +99,6 @@ if __name__ == "__main__":
     # Overlay on ctrl image (with 50% faded background)
     overlay_ctrl = sam_runner.overlay_mask(bgr, mask)
     cv2.imwrite(str(Path(args.out_dir) / "overlay_ctrl.png"), overlay_ctrl)
-    cv2.imwrite(str(Path(args.out_dir) / "overlay.png"), overlay_ctrl)
 
     # Overlay on sketch (if available)
     if sam_runner.sketch_bgr is not None:
