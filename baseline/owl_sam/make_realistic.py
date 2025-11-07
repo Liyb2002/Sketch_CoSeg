@@ -40,8 +40,10 @@ CONTROLNET_IDS = [
 
 # ----- default negative prompt & knobs (generic) -----
 NEGATIVE = (
-    "drawing, lineart, sketch, outline, cartoon, anime, cel shading, pencil, grayscale, "
-    "text, watermark, logo, frame, border, lowres, blurry, noisy background"
+    "drawing, lineart, sketch, outline, cartoon, anime, cel shading, pencil, painting, illustration, "
+    "grayscale, black and white, monochrome, lowres, low quality, low contrast, blurry, deformed, noisy, artifact, "
+    "text, watermark, logo, caption, frame, border, label, numbers, symbols, signature, background clutter, "
+    "abstract, surreal, unrealistic, extra limbs, cropped, partial, floating object, shadow mismatch"
 )
 STEPS       = 50
 GUIDANCE    = 4.5

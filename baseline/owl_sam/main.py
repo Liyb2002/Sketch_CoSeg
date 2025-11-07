@@ -25,6 +25,7 @@ def _slug(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", s.strip().lower()).strip("_")
 
 def _load_items(components_json: str) -> List[Dict[str, Any]]:
+    # *** unchanged behavior ***
     payload = json.load(open(components_json, "r"))
     comps = payload.get("components", [])
     items: List[Dict[str, Any]] = []
@@ -39,11 +40,27 @@ def _load_items(components_json: str) -> List[Dict[str, Any]]:
                 items.append({"name": n.strip(), "count": 1})
     return items
 
+def _get_object_label(components_json: str) -> str:
+    """
+    Get global object label for prompts without breaking anything.
+
+    Works with:
+      { "motobike": [ ... ] }   -> returns "motobike"
+      { "components": [...] }   -> falls back to "object" unless you later add 'object_name'
+    """
+    payload = json.load(open(components_json, "r"))
+    if isinstance(payload, dict):
+        if "components" not in payload and len(payload) == 1:
+            # your motobike-style JSON
+            return list(payload.keys())[0]
+        if "object_name" in payload:
+            return str(payload["object_name"])
+    return "object"
+
 def _color_for(lbl: str) -> tuple[int,int,int]:
     # BGR for cv2 overlays
     rng = np.random.default_rng(abs(hash(lbl)) % (2**32))
     c = rng.integers(50, 220, size=3, dtype=np.int32)
-    # return as BGR
     return int(c[2]), int(c[1]), int(c[0])
 
 def _save_mask_png(mask_bool: np.ndarray, out_path: str):
@@ -67,21 +84,44 @@ def main():
     Path(base_out_dir).mkdir(parents=True, exist_ok=True)
     Path(realism_img_dir).mkdir(parents=True, exist_ok=True)
 
-    # ---- multi-style prompts (domain-agnostic) ----
+    # ---- load items (same as before) ----
+    items = _load_items(components_json)
+
+    # ---- get object label for prompts (new) ----
+    object_label = _get_object_label(components_json)
+    # e.g. from { "motobike": [...] } => "motobike"
+
+    # ---- multi-style prompts (now labeled) ----
     styles = [
-        "photorealistic product photo of the object matching the sketch silhouette and pose, realistic materials, soft studio lighting, pure white seamless background, 85mm lens",
-        "cyberpunk style object matching the sketch silhouette and pose, neon accents, moody city lights, pure white background, professional render",
-        "vintage WWII era object matching the sketch silhouette and pose, brushed metal, worn paint, studio lighting, pure white background",
-        "futuristic minimal industrial design matching the sketch silhouette and pose, brushed aluminum, diffuse softbox lighting, pure white background",
-        "rusty weathered old industrial object matching the sketch silhouette and pose, subtle shadows, studio lighting, pure white background",
+        "high-resolution photograph of a {label} matching the sketch silhouette and pose exactly, "
+        "studio product photo, realistic materials and textures, neutral soft lighting, "
+        "subtle shadows, white background, sharp focus, no text, no watermark, no extra objects",
+
+        "realistic photo of a {label}, matching the sketch silhouette and pose, "
+        "natural colors, physically plausible lighting, simple real-world setting, most of the object should be black"
+        "clear separation from white background, no stylization, no sketch lines, no extra objects, no text",
+
+        "detailed realistic photo of a {label}, matching the sketch silhouette and pose, "
+        "accurate proportions, real-world materials, studio lighting, grean color domainate, white background, "
+        "crisp edges, no fantasy elements, no text, no extra props",
+
+        "high-detail real photo of a {label}, matching the sketch silhouette and pose exactly, "
+        "captured with a full-frame DSLR camera, realistic textures and materials, "
+        "visible metal wear, oil stains, authentic paint, subtle reflections, natural shadows", 
+
+        "clean Miyazaki-style illustration of a {label} from world war II, matching the sketch silhouette and pose, "
+        "solid lineart, flat shading, simple natural colors, plain light background, "
+        "no text, no sketch outline visible, object clearly readable and centered",
     ]
+
+    style_prompts = [s.format(label=object_label) for s in styles]
 
     # ---- 1) generate ctrl_* variants ----
     print("--------------------generate_variant realistic images--------------------")
     ctrl_paths = generate_variants(
         input_path=sketch_path,
         out_dir=realism_img_dir,
-        style_prompts=styles,
+        style_prompts=style_prompts,
         seed=2025,
     )
 
@@ -96,7 +136,6 @@ def main():
         pass
 
     # ---- 2) OWL detect + SAM masks per ctrl_i ----
-    items = _load_items(components_json)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # load sketch once (RGB/BGR) and keep for overlays
@@ -144,9 +183,10 @@ def main():
         else:
             sketch_bgr = sketch_bgr_full.copy()
 
-        # merged overlays across all labels for this variant
-        overlay_ctrl = bgr.astype(np.float32)          
-        overlay_skch = sketch_bgr.astype(np.float32)
+        # ---------- overlay logic: keep originals, tint only masks ----------
+        overlay_ctrl = bgr.copy().astype(np.float32)
+        overlay_skch = sketch_bgr.copy().astype(np.float32)
+        alpha = 0.4  # tint strength on masked pixels only
 
         for it in items:
             label = it["name"]
@@ -168,12 +208,16 @@ def main():
             # save merged mask
             _save_mask_png(merged, str(sub / f"{slug}_mask.png"))
 
-            # draw on both overlays with same color
-            overlay_ctrl[merged] = bgr[merged]
-            overlay_skch[merged] = sketch_bgr[merged]
+            # tint only the masked pixels with a label-specific color
+            col = np.array(_color_for(label), np.float32)  # BGR
+            overlay_ctrl[merged] = (1 - alpha) * overlay_ctrl[merged] + alpha * col
+            overlay_skch[merged] = (1 - alpha) * overlay_skch[merged] + alpha * col
+        # ---------- END overlay ----------
 
         overlay_ctrl = np.clip(overlay_ctrl, 0, 255).astype(np.uint8)
         overlay_skch = np.clip(overlay_skch, 0, 255).astype(np.uint8)
+
+        # ✅ overlays are saved here
         cv2.imwrite(str(sub / "overlay_ctrl.png"), overlay_ctrl)
         cv2.imwrite(str(sub / "overlay_sketch.png"), overlay_skch)
 
