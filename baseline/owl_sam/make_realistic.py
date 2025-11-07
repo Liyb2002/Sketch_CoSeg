@@ -46,9 +46,9 @@ NEGATIVE = (
     "abstract, surreal, unrealistic, extra limbs, cropped, partial, floating object, shadow mismatch"
 )
 STEPS       = 50
-GUIDANCE    = 4.5
+GUIDANCE    = 8.5
 CTRL_SCALE  = 0.95
-STRENGTH    = 0.92
+STRENGTH    = 0.4
 MAX_SIDE    = 1024  # internal generation size; output will be resized back to sketch size
 
 # ----- helpers -----
@@ -173,7 +173,7 @@ def generate_variants(
 
         refined = refiner(
             prompt=prompt, negative_prompt=NEGATIVE,
-            image=out, strength=0.25,
+            image=out, strength=0.2,
             num_inference_steps=20, guidance_scale=5.0,
             generator=gen,
         ).images[0]

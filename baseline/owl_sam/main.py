@@ -94,11 +94,11 @@ def main():
     # ---- multi-style prompts (now labeled) ----
     styles = [
         "high-resolution photograph of a {label} matching the sketch silhouette and pose exactly, "
-        "studio product photo, realistic materials and textures, neutral soft lighting, "
+        "studio product photo, realistic materials and textures, neutral soft lighting, in 21st century metalatic style"
         "subtle shadows, white background, sharp focus, no text, no watermark, no extra objects",
 
         "realistic photo of a {label}, matching the sketch silhouette and pose, "
-        "natural colors, physically plausible lighting, simple real-world setting, most of the object should be black"
+        "natural colors, physically plausible lighting, simple real-world setting, in cyberpunk style"
         "clear separation from white background, no stylization, no sketch lines, no extra objects, no text",
 
         "detailed realistic photo of a {label}, matching the sketch silhouette and pose, "
@@ -106,7 +106,7 @@ def main():
         "crisp edges, no fantasy elements, no text, no extra props",
 
         "high-detail real photo of a {label}, matching the sketch silhouette and pose exactly, "
-        "captured with a full-frame DSLR camera, realistic textures and materials, "
+        "captured with a full-frame DSLR camera, realistic textures and materials,"
         "visible metal wear, oil stains, authentic paint, subtle reflections, natural shadows", 
 
         "clean Miyazaki-style illustration of a {label} from world war II, matching the sketch silhouette and pose, "
