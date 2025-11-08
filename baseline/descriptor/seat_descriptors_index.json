@@ -1,0 +1,17 @@
+[
+  {
+    "id": "0",
+    "img_path": "inputs/0/img.png",
+    "mask_path": "inputs/0/mask.png"
+  },
+  {
+    "id": "1",
+    "img_path": "inputs/1/img.png",
+    "mask_path": "inputs/1/mask.png"
+  },
+  {
+    "id": "2",
+    "img_path": "inputs/2/img.png",
+    "mask_path": "inputs/2/mask.png"
+  }
+]
