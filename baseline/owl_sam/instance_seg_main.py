@@ -1,25 +1,35 @@
 #!/usr/bin/env python
-# Orchestrator for:
+# Full pipeline:
 #   inputs/{x}.png + inputs/components_{x}.json
-# -> outputs/{x}/realism_imgs/ctrl_*.png
-# -> outputs/{x}/ctrl_*/{label}_mask.png + overlays
+# -> outputs/{x}/realism_imgs/ctrl_*.png         (aligned to sketch)
+# -> outputs/{x}/ctrl_*/{label}_mask.png        (SAM from OWL boxes)
+# -> outputs/{x}/probabilistic_aggregate/*      (probability maps + mosaics)
+# -> outputs/{x}/fragments/{label}/*            (per-fragment masks + overlays)
+#
+# Uses:
+#   - make_realistic.generate_variants
+#   - owl.detect_owlv2_boxes_counts
+#   - sam.SamRunner
+#   - probabilistic_combine.probabilistic_combine
+#   - create_segments.create_segments
 
-import os, re, json
+import os
+import re
+import json
 from pathlib import Path
 from typing import Dict, Any, List
+
 import numpy as np
 from PIL import Image
 import cv2
 import torch
 
-# baseline detector (DO NOT MODIFY its behavior in other files)
 from owl import detect_owlv2_boxes_counts
-
-# SAM wrapper
 from sam import SamRunner
-
-# realism generator
 from make_realistic import generate_variants
+from probabilistic_combine import probabilistic_combine
+from create_segments import create_segments
+import helper
 
 # ---------------- utils ----------------
 def _slug(s: str) -> str:
@@ -29,7 +39,7 @@ def _load_items(components_json: str) -> List[Dict[str, Any]]:
     payload = json.load(open(components_json, "r"))
     comps = payload.get("components", [])
     items: List[Dict[str, Any]] = []
-    if comps and isinstance(comps[0], dict):
+    if comps and isinstance(comps, list) and comps and comps and isinstance(comps[0], dict):
         for it in comps:
             n = str(it.get("name", "")).strip()
             c = int(it.get("count", 1))
@@ -43,12 +53,9 @@ def _load_items(components_json: str) -> List[Dict[str, Any]]:
 
 def _get_object_label(components_json: str) -> str:
     """
-    Get global object label for prompts.
-
-    Examples:
-      { "object_name": "car", "components": [...] } -> "car"
-      { "motobike": [ ... ] }                      -> "motobike"
-      fallback                                      -> "object"
+    Prefer explicit object_name.
+    Fallback: single-key dict (e.g. { "motobike": [...] }).
+    Else: "object".
     """
     payload = json.load(open(components_json, "r"))
     if isinstance(payload, dict):
@@ -89,9 +96,9 @@ def main():
 
     for sketch_path in png_files:
         idx = sketch_path.stem
-        components_json = inputs_dir / f"components_{idx}.json"
+        components_json_path = inputs_dir / f"components_{idx}.json"
 
-        if not components_json.exists():
+        if not components_json_path.exists():
             print(f"[WARN] Missing components_{idx}.json for {sketch_path.name}, skipping.")
             continue
 
@@ -102,21 +109,22 @@ def main():
 
         print(f"\n==================== Processing {idx}.png ====================")
 
-        # ---- load items + object label ----
-        items = _load_items(str(components_json))
+        # ---- load per-image config ----
+        items = _load_items(str(components_json_path))
         if not items:
-            print(f"[WARN] No components found in {components_json}, skipping.")
+            print(f"[WARN] No components found in {components_json_path}, skipping.")
             continue
 
-        object_label = _get_object_label(str(components_json))
+        object_label = _get_object_label(str(components_json_path))
 
-        # ---- enriched OWL items: use object_name in text prompt ----
-        # Results will STILL be keyed by plain component "name".
+        # ---- enriched OWL items: use object_name in query ----
         owl_items: List[Dict[str, Any]] = []
         for it in items:
             nm = it["name"]
-            # e.g. "door of a car" instead of just "door"
-            query = f"{nm} of a {object_label}" if object_label != "object" else nm
+            if object_label != "object":
+                query = f"{nm} of a {object_label}"
+            else:
+                query = nm
             owl_items.append({
                 "name": nm,
                 "count": it["count"],
@@ -148,7 +156,7 @@ def main():
         ]
         style_prompts = [s.format(label=object_label) for s in styles]
 
-        # ---- 1) generate ctrl_* variants ----
+        # ---- 1) generate aligned ctrl_* variants ----
         print("-------------------- generate_variant realistic images --------------------")
         ctrl_paths = generate_variants(
             input_path=str(sketch_path),
@@ -157,12 +165,11 @@ def main():
             seed=2025,
         )
 
-        # free VRAM (best-effort)
+        # free VRAM (SDXL) best-effort before OWL+SAM
         try:
             import gc
             gc.collect()
             if torch.cuda.is_available():
-                os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
                 torch.cuda.empty_cache()
         except Exception:
             pass
@@ -170,6 +177,7 @@ def main():
         # ---- 2) OWL detect + SAM masks per ctrl_i ----
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+        # load sketch once
         sketch_rgb = np.array(Image.open(sketch_path).convert("RGB"))
         sketch_bgr_full = cv2.cvtColor(sketch_rgb, cv2.COLOR_RGB2BGR)
 
@@ -187,11 +195,11 @@ def main():
             sub = base_out_dir / p.stem          # e.g., outputs/x/ctrl_0
             sub.mkdir(parents=True, exist_ok=True)
 
-            # --- OWL on this ctrl image (using enriched owl_items) ---
+            # --- OWL on this ctrl image ---
             img = Image.open(p).convert("RGB")
             results = detect_owlv2_boxes_counts(
                 image_pil=img,
-                items=owl_items,  # uses query if present
+                items=owl_items,
                 model_id="google/owlv2-large-patch14",
                 use_tiles=True,
                 tile_grid=3,
@@ -201,15 +209,27 @@ def main():
                 enforce_no_overlap=False,
             )
 
+            # --- Save OWL detection results as JSON ---
+            results_json_path = sub / "owl_results.json"
+            try:
+                serializable_results = helper._to_serializable(results)
+                with open(results_json_path, "w") as f:
+                    json.dump(serializable_results, f, indent=2)
+                print(f"Saved OWL results → {results_json_path}")
+            except Exception as e:
+                print(f"[WARN] Failed to save OWL results for {p.name}: {e}")
+
+
             det_count = sum(len(v["boxes"]) for v in results.values())
             print(f"{idx}/{p.stem}: {det_count} detections")
 
-            # --- SAM on this ctrl image (box → mask) ---
+            # --- SAM on this ctrl image (box → merged mask per label) ---
             rgb = np.array(img)
             bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
             H, W = rgb.shape[:2]
             sam_runner.set_image(rgb)
 
+            # resize sketch to ctrl size if needed
             if sketch_bgr_full.shape[:2] != (H, W):
                 sketch_bgr = cv2.resize(sketch_bgr_full, (W, H), interpolation=cv2.INTER_LINEAR)
             else:
@@ -219,13 +239,13 @@ def main():
             overlay_skch = sketch_bgr.astype(np.float32)
             alpha = 0.4
 
-            # iterate over original items (names) since results are keyed by name
             for it in items:
                 label = it["name"]
                 slug  = _slug(label)
                 boxes = results.get(label, {}).get("boxes", np.empty((0, 4), np.float32))
 
                 if boxes is None or len(boxes) == 0:
+                    # still save an empty mask for consistency
                     empty = np.zeros((H, W), dtype=bool)
                     _save_mask_png(empty, str(sub / f"{slug}_mask.png"))
                     continue
@@ -246,6 +266,46 @@ def main():
 
             cv2.imwrite(str(sub / "overlay_ctrl.png"), overlay_ctrl)
             cv2.imwrite(str(sub / "overlay_sketch.png"), overlay_skch)
+
+            # per-ctrl cleanup
+            try:
+                del img, rgb, bgr, overlay_ctrl, overlay_skch
+            except Exception:
+                pass
+            try:
+                import gc
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
+
+        # ---- 3) probabilistic aggregation (per-label prob maps + overlays) ----
+        probabilistic_combine(
+            base_out_dir=str(base_out_dir),
+            components_json=str(components_json_path),
+            original_image_path=str(sketch_path),
+        )
+
+        # ---- 4) fragment extraction + visualization overlays ----
+        create_segments(
+            base_out_dir=str(base_out_dir),
+            components_json=str(components_json_path),
+            original_image_path=str(sketch_path),
+        )
+
+        # ---- per-sketch cleanup ----
+        try:
+            del sam_runner, sketch_rgb, sketch_bgr_full, ctrl_paths, items, owl_items
+        except Exception:
+            pass
+        try:
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
 
     print("\n[DONE] Processed all valid inputs in 'inputs/'.")
 
