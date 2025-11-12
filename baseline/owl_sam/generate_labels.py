@@ -9,7 +9,7 @@ INPUT_DIR = "inputs"
 
 # Lighter, vision-capable models for this task
 MODEL_STEP1 = "gpt-4.1"       # for object_type + components detection
-MODEL_STEP2 = "gpt-4.1-mini"  # for per-image counting
+MODEL_STEP2 = "gpt-4.1"  # for per-image counting
 
 client = OpenAI()
 
@@ -177,11 +177,12 @@ def analyze_image_components(object_type: str, components: List[str], image_file
                     f"{components}\n\n"
                     "TASK:\n"
                     "For THIS image only, count how many of each listed component are present.\n"
-                    "Rules:\n"
-                    "- You MUST NOT introduce new component names.\n"
-                    "- If a component from the list is not present, set its count to 0.\n"
-                    "- Only count components clearly visible in the sketch.\n"
-                    "- Return ONLY valid JSON in this exact format:\n"
+                    "STRICT RULES:\n"
+                    "- DO NOT guess or imagine hidden parts (e.g., the far side or inside parts not visible in this 2D view).\n"
+                    "- Only count components that are explicitly drawn and visible in this image.\n"
+                    "- If a component is partially visible but not clearly countable, set its count to 0.\n"
+                    "- If a component is not visible, set its count to 0.\n"
+                    "- You MUST NOT introduce or rename components.\n\n"
                     "{\n"
                     f"  \"image\": \"{filename}\",\n"
                     f"  \"object_name\": \"{object_type}\",\n"
