@@ -1,29 +1,30 @@
 #!/usr/bin/env python
 import json
 import random
+import shutil
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 from PIL import Image
 
-import torch
-from transformers import CLIPProcessor, CLIPModel
-
 # ----------------- config -----------------
 INPUTS_DIR = Path("inputs")
 OUTPUTS_DIR = Path("outputs")
 DIFF_THRESH = 12  # threshold to detect fragment from overlay
-CLIP_MODEL_ID = "openai/clip-vit-base-patch32"
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-random.seed(0)  # reproducible ctrl_* choice
 
 
 # ----------------- helpers -----------------
 def _slug(s: str) -> str:
     import re
     return re.sub(r"[^a-z0-9]+", "_", s.strip().lower()).strip("_")
+
+
+def _ensure_clean_dir(path: Path) -> None:
+    """Delete a directory if it exists, then recreate it empty."""
+    if path.exists():
+        shutil.rmtree(path)
+    path.mkdir(parents=True, exist_ok=True)
 
 
 def _make_faint(arr_rgb: np.ndarray) -> np.ndarray:
@@ -63,13 +64,20 @@ def _sample_points_from_mask(mask: np.ndarray, k: int = 3) -> List[Tuple[int, in
 
 def _load_owl_boxes(owl_json_path: Path) -> Dict[str, Dict[str, np.ndarray]]:
     """
-    Load OWL boxes; supports:
+    Load OWL boxes.
+
+    Supports:
       {
-        "wheel": { "boxes": [...], "scores": [...], ... }, ...
+        "wheel": { "boxes": [...], "scores": [...], ... },
+        "window": { ... },
+        ...
       }
     or:
       {
-        "labels": { "wheel": { "boxes": [...], "scores": [...] }, ... }
+        "labels": {
+          "wheel": { "boxes": [...], "scores": [...] },
+          ...
+        }
       }
     """
     if not owl_json_path.exists():
@@ -97,7 +105,7 @@ def _points_inside_box(
     points: List[Tuple[int, int]],
     box: Tuple[float, float, float, float],
 ) -> bool:
-    """True iff ALL points are inside/on the box."""
+    """Return True iff ALL points are inside/on the box."""
     x1, y1, x2, y2 = box
     for px, py in points:
         if not (x1 <= px <= x2 and y1 <= py <= y2):
@@ -105,40 +113,13 @@ def _points_inside_box(
     return True
 
 
-# ---------- NEW: map slugs to display text & enumerate all labels ----------
-def _label_slug_to_text_map(comp0_path: Path) -> Dict[str, str]:
+def _get_all_reference_labels() -> List[Tuple[str, str]]:
     """
-    Build a mapping from slug -> human-readable text from inputs/components_0.json.
-    Falls back to slug itself when no mapping is found.
-    """
-    slug2text: Dict[str, str] = {}
-    if not comp0_path.exists():
-        return slug2text
+    From outputs/0/fragments:
+      - get all label slugs (subfolders)
+      - map each to human-readable text via inputs/components_0.json if possible
 
-    with open(comp0_path, "r") as f:
-        payload0 = json.load(f)
-
-    comps0 = payload0.get("components", [])
-    # supports: [{"name": "..."} ...] OR ["...", ...]
-    if comps0 and isinstance(comps0[0], dict):
-        for it in comps0:
-            n = str(it.get("name", "")).strip()
-            if n:
-                slug2text[_slug(n)] = n
-    else:
-        for n in comps0:
-            if isinstance(n, str):
-                n = n.strip()
-                if n:
-                    slug2text[_slug(n)] = n
-    return slug2text
-
-
-def _determine_reference_labels() -> List[Tuple[str, str]]:
-    """
-    Read all label subfolders from outputs/0/fragments and map each slug
-    to human-readable text using inputs/components_0.json when possible.
-    Returns a sorted list of (slug, text).
+    Returns: list of (ref_label_slug, ref_label_text)
     """
     x0_frag_root = OUTPUTS_DIR / "0" / "fragments"
     if not x0_frag_root.exists():
@@ -148,18 +129,40 @@ def _determine_reference_labels() -> List[Tuple[str, str]]:
     if not label_slugs:
         raise SystemExit("[ERR] No label subfolders in outputs/0/fragments.")
 
-    slug2text = _label_slug_to_text_map(INPUTS_DIR / "components_0.json")
+    slug_to_text = {slug: slug for slug in label_slugs}
 
-    out = []
+    comp0_path = INPUTS_DIR / "components_0.json"
+    if comp0_path.exists():
+        with open(comp0_path, "r") as f:
+            payload0 = json.load(f)
+        comps0 = payload0.get("components", [])
+
+        if comps0 and isinstance(comps0[0], dict):
+            for it in comps0:
+                n = str(it.get("name", "")).strip()
+                if not n:
+                    continue
+                s = _slug(n)
+                if s in slug_to_text:
+                    slug_to_text[s] = n
+        else:
+            for n in comps0:
+                if not isinstance(n, str):
+                    continue
+                n = n.strip()
+                if not n:
+                    continue
+                s = _slug(n)
+                if s in slug_to_text:
+                    slug_to_text[s] = n
+
+    result: List[Tuple[str, str]] = []
     for slug in label_slugs:
-        text = slug2text.get(slug, slug)
-        out.append((slug, text))
+        txt = slug_to_text[slug]
+        print(f"[INFO] Reference label: slug='{slug}', text='{txt}'")
+        result.append((slug, txt))
 
-    print("[INFO] Reference labels:")
-    for slug, text in out:
-        print(f"   - slug='{slug}', text='{text}'")
-    return out
-# ---------------------------------------------------------------------------
+    return result
 
 
 def _get_object_name(x_id: str) -> str:
@@ -173,22 +176,6 @@ def _get_object_name(x_id: str) -> str:
     return name or "object"
 
 
-# ---- new: ensure minimum image size to avoid 1-pixel dims ambiguity ----
-def _ensure_min_size(img: Image.Image, min_size: int = 2) -> Image.Image:
-    """
-    Ensure the image is at least min_size x min_size by padding on a white canvas.
-    This avoids shape ambiguities like (1, W, 3) that confuse preprocessors.
-    """
-    img = img.convert("RGB")
-    w, h = img.size
-    if w >= min_size and h >= min_size:
-        return img
-    new_w, new_h = max(w, min_size), max(h, min_size)
-    out = Image.new("RGB", (new_w, new_h), (255, 255, 255))
-    out.paste(img, (0, 0))
-    return out
-
-
 def _mask_ctrl_fragment_image(
     ctrl_img: np.ndarray,
     frag_mask: np.ndarray,
@@ -199,7 +186,7 @@ def _mask_ctrl_fragment_image(
     """
     H, W = frag_mask.shape
 
-    # If sizes differ, resize mask to ctrl size (binary NN)
+    # If sizes differ (rare), resize mask to ctrl_img size with nearest-neighbor
     if (ctrl_img.shape[0], ctrl_img.shape[1]) != (H, W):
         Hc, Wc = ctrl_img.shape[:2]
         frag_mask = np.array(
@@ -209,16 +196,20 @@ def _mask_ctrl_fragment_image(
         ) > 0
         H, W = Hc, Wc
 
+    # White canvas
     masked = np.ones_like(ctrl_img, dtype=np.uint8) * 255
+
+    # Use 2D mask; np will select N×C rows, preserving channels
     masked[frag_mask] = ctrl_img[frag_mask]
 
+    # Tight crop around the mask
     ys, xs = np.where(frag_mask)
     if ys.size == 0 or xs.size == 0:
-        return _ensure_min_size(Image.fromarray(masked))
+        return Image.fromarray(masked)
 
     x1, y1, x2, y2 = xs.min(), ys.min(), xs.max() + 1, ys.max() + 1
     crop = masked[y1:y2, x1:x2, :]
-    return _ensure_min_size(Image.fromarray(crop))
+    return Image.fromarray(crop)
 
 
 def _crop_box_image(ctrl_img: np.ndarray, box: Tuple[float, float, float, float]) -> Image.Image:
@@ -230,45 +221,48 @@ def _crop_box_image(ctrl_img: np.ndarray, box: Tuple[float, float, float, float]
     y1 = max(0, min(int(y1), h))
     y2 = max(0, min(int(y2), h))
     if x2 <= x1 or y2 <= y1:
-        return _ensure_min_size(Image.fromarray(ctrl_img))
-    return _ensure_min_size(Image.fromarray(ctrl_img[y1:y2, x1:x2, :]))
+        return Image.fromarray(ctrl_img)
+    return Image.fromarray(ctrl_img[y1:y2, x1:x2, :])
 
 
-# ----------------- CLIP helpers -----------------
-def _prepare_clip():
-    model = CLIPModel.from_pretrained(CLIP_MODEL_ID).to(DEVICE)
-    processor = CLIPProcessor.from_pretrained(CLIP_MODEL_ID)
-    return model, processor
+def _overlay_mask_on_sketch(
+    sketch_img: np.ndarray,
+    frag_mask: np.ndarray,
+    color: Tuple[int, int, int] = (255, 0, 0),
+    alpha: float = 0.5,
+) -> Image.Image:
+    """
+    Overlay the fragment mask onto the original sketch.
 
+    - sketch_img: HxWx3 uint8
+    - frag_mask:  HxW bool
+    - color:      overlay color for the fragment region
+    - alpha:      how strong the tint is (0–1)
+    """
+    # Ensure shapes match (they should, since mask was computed from sketch)
+    H, W = frag_mask.shape
+    if sketch_img.shape[:2] != (H, W):
+        # If somehow mismatched, resize mask to sketch size
+        frag_mask = np.array(
+            Image.fromarray((frag_mask.astype(np.uint8) * 255)).resize(
+                (sketch_img.shape[1], sketch_img.shape[0]), resample=Image.NEAREST
+            )
+        ) > 0
 
-def _encode_image(model, processor, img: Image.Image) -> np.ndarray:
-    # Ensure valid size & explicit channels-last format to avoid ambiguity.
-    img = _ensure_min_size(img.convert("RGB"), min_size=2)
-    inputs = processor(
-        images=img,
-        return_tensors="pt",
-        input_data_format="channels_last"  # disambiguate degenerate shapes
-    ).to(DEVICE)
-    with torch.no_grad():
-        feats = model.get_image_features(**inputs)
-    v = feats[0].detach().cpu().numpy().astype(np.float32)
-    n = np.linalg.norm(v) + 1e-8
-    return v / n
+    overlay = sketch_img.copy().astype(np.float32)
+    color_arr = np.array(color, dtype=np.float32)
 
+    # Apply tint only where mask is True
+    overlay[frag_mask] = (1.0 - alpha) * overlay[frag_mask] + alpha * color_arr
 
-def _encode_text(model, processor, text: str) -> np.ndarray:
-    inputs = processor(text=[text], return_tensors="pt", padding=True).to(DEVICE)
-    with torch.no_grad():
-        feats = model.get_text_features(**inputs)
-    v = feats[0].detach().cpu().numpy().astype(np.float32)
-    n = np.linalg.norm(v) + 1e-8
-    return v / n
+    overlay = np.clip(overlay, 0, 255).astype(np.uint8)
+    return Image.fromarray(overlay)
 
 
 # ----------------- main -----------------
 def main():
-    ref_labels = _determine_reference_labels()  # list[(slug, text)]
-    model, processor = _prepare_clip()
+    # get all labels (slug, text) from outputs/0/fragments
+    ref_labels = _get_all_reference_labels()
 
     for x_dir in sorted(OUTPUTS_DIR.iterdir()):
         if not x_dir.is_dir():
@@ -276,48 +270,59 @@ def main():
         x_id = x_dir.name
 
         sketch_path = INPUTS_DIR / f"{x_id}.png"
-        sketch_img = np.array(Image.open(sketch_path).convert("RGB"))
         realism_dir = x_dir / "realism_imgs"
         if not sketch_path.exists() or not realism_dir.exists():
             continue
 
+        # clean encoder_test if it existed before, then recreate
+        test_dir = x_dir / "encoder_test"
+        _ensure_clean_dir(test_dir)
+
+        # load sketch once per x
+        sketch_img = np.array(Image.open(sketch_path).convert("RGB"))
+        object_name = _get_object_name(x_id)
+
+        # loop over all labels
         for ref_label_slug, ref_label_text in ref_labels:
             fragments_dir = x_dir / "fragments" / ref_label_slug
             if not fragments_dir.exists():
-                # label not present for this x_id → skip
                 continue
 
-            overlay_paths = sorted(fragments_dir.glob(f"{ref_label_slug}_frag_*_overlay.png"))
+            overlay_paths = sorted(
+                fragments_dir.glob(f"{ref_label_slug}_frag_*_overlay.png")
+            )
             if not overlay_paths:
                 continue
 
-            # embeddings output folder
-            emb_dir = x_dir / "embeddings" / ref_label_slug
-            emb_dir.mkdir(parents=True, exist_ok=True)
+            # per-label subfolder under encoder_test
+            label_dir = test_dir / ref_label_slug
+            label_dir.mkdir(parents=True, exist_ok=True)
 
-            object_name = _get_object_name(x_id)
-            text_for_x = f"{ref_label_text} of a {object_name}"
+            text_embed = f"{ref_label_text} of a {object_name}"
 
             for overlay_path in overlay_paths:
-                # parse fragment index
+                # parse fragment index if present
                 stem = overlay_path.stem  # {slug}_frag_k_overlay
+                frag_idx: Optional[int] = None
                 try:
-                    frag_idx_part = stem.split("_frag_")[1]
-                    frag_idx = int(frag_idx_part.split("_")[0])
+                    frag_idx = int(stem.split("_frag_")[1].split("_")[0])
                 except Exception:
-                    frag_idx = -1
+                    # keep as None if parsing fails
+                    pass
 
-                # fragment mask
+                frag_suffix = frag_idx if frag_idx is not None else stem
+
+                # 1) reconstruct fragment mask
                 frag_mask = _reconstruct_fragment_mask_full(overlay_path, sketch_path)
                 if frag_mask.sum() == 0:
                     continue
 
-                # sample points
+                # sample 3 points
                 sample_points = _sample_points_from_mask(frag_mask, k=3)
                 if not sample_points:
                     continue
 
-                # find ALL contributing ctrl_* and remember the matching box
+                # 2) find all contributing ctrl_* and the box used
                 contrib: Dict[str, Tuple[float, float, float, float]] = {}
 
                 for ctrl_dir in sorted(x_dir.glob("ctrl_*")):
@@ -334,12 +339,14 @@ def main():
                     if not boxes_data:
                         continue
 
+                    # candidate label keys
                     keys = [
                         ref_label_text,
                         ref_label_slug,
                         ref_label_text.lower(),
                         ref_label_slug.lower(),
                     ]
+
                     all_boxes = []
                     for k in keys:
                         if k in boxes_data:
@@ -348,59 +355,50 @@ def main():
                                 all_boxes.append(b)
                     if not all_boxes:
                         continue
+
                     all_boxes = np.concatenate(all_boxes, axis=0)
 
+                    # find first box that contains all sample points
                     for b in all_boxes:
                         x1, y1, x2, y2 = map(float, b.tolist())
                         if _points_inside_box(sample_points, (x1, y1, x2, y2)):
                             contrib[ctrl_dir.name] = (x1, y1, x2, y2)
-                            break  # one good box per ctrl is enough
+                            break  # one box per ctrl is enough
 
                 if not contrib:
-                    # no ctrl supports this fragment → skip embedding
+                    # no ctrl_* supports this fragment; skip
                     continue
 
-                # pick one ctrl_* at random and get its box
+                # pick ONE ctrl_* at random for this fragment
                 ctrl_name = random.choice(list(contrib.keys()))
                 box = contrib[ctrl_name]
 
-                # load ctrl image
+                # load corresponding ctrl image
                 ctrl_img_path = realism_dir / f"{ctrl_name}.png"
                 if not ctrl_img_path.exists():
                     continue
                 ctrl_img = np.array(Image.open(ctrl_img_path).convert("RGB"))
 
-                # 1) emb_mask
-                img_mask = _mask_ctrl_fragment_image(sketch_img, frag_mask)
-                emb_mask = _encode_image(model, processor, img_mask)
+                # 1) masked fragment image (for visual check of emb_mask)
+                img_mask = _mask_ctrl_fragment_image(ctrl_img, frag_mask)
+                mask_out = label_dir / f"{ref_label_slug}_frag_{frag_suffix}_mask.png"
+                # img_mask.save(mask_out)
 
-                # 2) emb_box
+                # 2) bounding box crop image (for visual check of emb_box)
                 img_box = _crop_box_image(sketch_img, box)
-                emb_box = _encode_image(model, processor, img_box)
+                box_out = label_dir / f"{ref_label_slug}_frag_{frag_suffix}_box.png"
+                img_box.save(box_out)
 
-                # 3) emb_text
-                emb_text = _encode_text(model, processor, text_for_x)
+                # 3) overlay of fragment on the original sketch
+                img_overlay = _overlay_mask_on_sketch(sketch_img, frag_mask)
+                overlay_out = label_dir / f"{ref_label_slug}_frag_{frag_suffix}_sketch_overlay.png"
+                # img_overlay.save(overlay_out)
 
-                # save npz
-                out_path = emb_dir / f"{ref_label_slug}_frag_{frag_idx}_embed.npz"
-                meta = {
-                    "x_id": x_id,
-                    "label": ref_label_text,
-                    "label_slug": ref_label_slug,
-                    "frag_index": frag_idx,
-                    "ctrl_name": ctrl_name,
-                    "box": [int(v) for v in box],
-                    "text": text_for_x,
-                }
-                np.savez_compressed(
-                    out_path,
-                    emb_mask=emb_mask,
-                    emb_box=emb_box,
-                    emb_text=emb_text,
-                    meta=json.dumps(meta),
+                # 4) text embedding string: print it for sanity
+                print(
+                    f"[x={x_id}] label='{ref_label_slug}' frag {frag_suffix}: "
+                    f"ctrl={ctrl_name}, text='{text_embed}'"
                 )
-
-                print(f"[x={x_id} | {ref_label_slug}] frag {frag_idx}: saved -> {out_path.name}")
 
 
 if __name__ == "__main__":
