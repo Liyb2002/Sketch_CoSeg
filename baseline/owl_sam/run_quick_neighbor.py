@@ -1,114 +1,130 @@
-#!/usr/bin/env python3
-# run_quick_neighbor.py — zero-training classifier using only emb_box (local neighborhood).
-# Builds a robust prototype per label and scores fragments by cosine similarity.
-
-import os, json
-import numpy as np
+#!/usr/bin/env python
+import json
 from pathlib import Path
+from typing import List, Dict, Any
 
+import numpy as np
+
+# ----------------- HARD-CODED CONFIG -----------------
 OUTPUTS_DIR = Path("outputs")
-LABEL       = "engine"     # <-- change your label
-TRIM_KEEP   = 0.60         # keep top 60% by similarity each refinement
-ITERS       = 3            # refinement iterations
-SIG_SCALE   = 3.0
-SIG_SHIFT   = 0.0
+ENGINE_LABEL = "engine"   # <- change this if your label slug is different
+# -----------------------------------------------------
 
-def _load_emb_box(npz_path: Path):
-    d = np.load(npz_path, allow_pickle=True)
-    # pick which embedding you want as your "feature"
-    # z = d["emb_mask"].astype(np.float32)   # (512,) instead of emb_box
-    z = d["emb_box"].astype(np.float32) # or text, if you prefer
-    # z = d["emb_text"].astype(np.float32) # or text, if you prefer
-    
-    # z = np.random.randn(*z.shape).astype(np.float32)  # <-- sanity-test line, keep as-is for now
 
-    n = np.linalg.norm(z) + 1e-8
-    return z / n, json.loads(str(d["meta"].item()))
+def load_embeddings_for_x(x_dir: Path) -> List[Dict[str, Any]]:
+    """
+    Load all *.npz from:
+        outputs/x/embeddings/ENGINE_LABEL/
 
-def _robust_centroid(Z, keep=0.6, iters=3):
-    # Z: (N, 512) normalized
-    c = Z.mean(axis=0)
-    c /= (np.linalg.norm(c) + 1e-8)
-    for _ in range(iters):
-        sims = Z @ c  # cosine sim since normalized
-        idx = np.argsort(sims)[::-1]
-        k = max(1, int(len(idx) * keep))
-        Zk = Z[idx[:k]]
-        c = Zk.mean(axis=0)
-        c /= (np.linalg.norm(c) + 1e-8)
-    return c
+    Each .npz is expected to contain: emb_mask, emb_box, emb_text, meta.
+    Returns a list of dicts: { "path", "emb", "meta" }.
+    """
+    items: List[Dict[str, Any]] = []
 
-def _sigmoid(x):  # stable-ish
-    x = np.clip(x, -40.0, 40.0)
-    return 1.0 / (1.0 + np.exp(-x))
+    emb_dir = x_dir / "embeddings" / ENGINE_LABEL
+    if not emb_dir.exists() or not emb_dir.is_dir():
+        return items
+
+    npz_paths = sorted(emb_dir.glob("*.npz"))
+    if not npz_paths:
+        return items
+
+    for p in npz_paths:
+        data = np.load(p, allow_pickle=True)
+
+        emb_mask = data["emb_mask"].astype(np.float32)
+        emb_box = data["emb_box"].astype(np.float32)
+
+        # Combine into one embedding vector per item
+        emb = (emb_mask + emb_box) / 2.0
+        emb = emb / (np.linalg.norm(emb) + 1e-8)
+
+
+        meta_raw = data["meta"]
+        meta = json.loads(str(meta_raw))  # meta was saved via json.dumps
+
+        items.append({
+            "path": p,
+            "emb": emb,
+            "meta": meta,
+        })
+
+    return items
+
+
+def compute_group_scores_0_to_1(embs: np.ndarray) -> np.ndarray:
+    """
+    Compute a 0-1 group score for each embedding:
+        - 1.0 = most similar to group
+        - 0.0 = least similar (outlier)
+
+    Based on average cosine similarity.
+    """
+    N, D = embs.shape
+    if N == 1:
+        return np.array([1.0], dtype=np.float32)
+
+    # cosine similarity matrix
+    sim_matrix = embs @ embs.T
+
+    # average similarity to others
+    sim_sums = sim_matrix.sum(axis=1) - np.diag(sim_matrix)
+    avg_sim = sim_sums / (N - 1)
+
+    # min-max normalize to 0..1
+    mn = avg_sim.min()
+    mx = avg_sim.max()
+    if mx - mn < 1e-12:
+        return np.ones(N, dtype=np.float32)
+
+    scores = (avg_sim - mn) / (mx - mn)
+    return scores.astype(np.float32)
+
 
 def main():
-    # 1) Collect all emb_box for this LABEL
-    records = []  # [(x_id, frag_idx, npz_path, z_box)]
-    for x_dir in sorted([p for p in OUTPUTS_DIR.iterdir() if p.is_dir()]):
-        emb_dir = x_dir / "embeddings" / LABEL
-        if not emb_dir.exists():
+    any_found = False
+
+    # Loop over all x directories under outputs/
+    for x_dir in sorted(OUTPUTS_DIR.iterdir()):
+        if not x_dir.is_dir():
             continue
-        for p in sorted(emb_dir.glob(f"{LABEL}_frag_*_embed.npz")):
-            z, meta = _load_emb_box(p)
-            x_id = meta.get("x_id", x_dir.name)
-            try:
-                frag_idx = int(meta.get("frag_index", -1))
-            except Exception:
-                frag_idx = -1
-            records.append((x_id, frag_idx, p, z))
 
-    if not records:
-        print(f"[quick] No embeddings found for label '{LABEL}'.")
-        return
+        x_id = x_dir.name
+        items = load_embeddings_for_x(x_dir)
+        if not items:
+            continue
 
-    Z = np.stack([r[3] for r in records], axis=0)  # (N,512)
+        any_found = True
+        embs = np.stack([it["emb"] for it in items], axis=0)  # (N, D)
+        probs = compute_group_scores_0_to_1(embs)
 
-    # 2) Build robust centroid
-    proto = _robust_centroid(Z, keep=TRIM_KEEP, iters=ITERS)
 
-    # 3) Score each fragment and produce p_true via sigmoid
-    sims = Z @ proto  # cosine similarity in [-1,1]
+        for it, p in zip(items, probs):
+            it["prob"] = float(p)
 
-    # Compute distribution stats of similarities
-    mu = float(sims.mean())
-    sigma = float(sims.std())
+        # Sort by prob descending (most in-group first)
+        items_sorted = sorted(items, key=lambda x: -x["prob"])
 
-    # If everyone looks identical (no spread), treat as "perfect neighbors"
-    if sigma < 1e-6:
-        p_true = np.ones_like(sims, dtype=np.float32)
-    else:
-        # For general case: z-score and require large positive deviation
-        zscore = (sims - mu) / (sigma + 1e-8)
+        print("=====================================================")
+        print(f"x_id = {x_id} | group folder = embeddings/{ENGINE_LABEL}")
+        print("Higher prob = more likely to belong to this group")
+        print("Lower prob = more likely to be the odd one out")
+        print("=====================================================")
 
-        # How many std above mean counts as being a real neighbor
-        K_SHIFT = 3.0  # increase to 4.0+ to be stricter
+        def describe(it):
+            meta = it["meta"]
+            label = meta.get("label", meta.get("label_slug", ""))
+            frag = meta.get("frag_index", "?")
+            return f"label={label}, frag={frag}, file={it['path'].name}"
 
-        logits = SIG_SCALE * (zscore - K_SHIFT)
-        p_true = _sigmoid(logits).astype(np.float32)  # in (0,1)
+        for it in items_sorted:
+            print(f"prob={it['prob']:.4f} :: {describe(it)}")
 
-    # 4) Save assignments in the same format used by the trainer
-    for (x_id, frag_idx, npz_path, _), p in zip(records, p_true):
-        co_dir = npz_path.parent.parent.parent / "co_seg"  # outputs/x/co_seg
-        co_dir.mkdir(parents=True, exist_ok=True)
-        out = {
-            "label_slug": LABEL,
-            "x_id": str(x_id),
-            "frag_index": int(frag_idx),
-            "K": 2,
-            "probs": [float(1.0 - p), float(p)],  # [p_non, p_true]
-            "method": "quick_neighbor_cosine",
-            "sim": float(sims[np.where(p_true==p)[0][0]]) if np.ndim(p_true)>0 else float(sims),
-            "proto_trim_keep": TRIM_KEEP,
-            "proto_iters": ITERS,
-            "sig_scale": SIG_SCALE,
-            "sig_shift": SIG_SHIFT,
-        }
-        out_path = co_dir / f"{LABEL}_frag_{frag_idx}_assign.json"
-        with open(out_path, "w") as f:
-            json.dump(out, f, indent=2)
+        print()  # blank line between x_ids
 
-    print(f"[quick] Done. Wrote assignments under outputs/*/co_seg/ using emb_box-only.")
+    if not any_found:
+        print(f"[ERR] No embeddings found under {OUTPUTS_DIR}/x/embeddings/{ENGINE_LABEL}/")
+
 
 if __name__ == "__main__":
     main()

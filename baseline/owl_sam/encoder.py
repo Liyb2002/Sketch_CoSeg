@@ -105,7 +105,7 @@ def _points_inside_box(
     return True
 
 
-# ---------- NEW: map slugs to display text & enumerate all labels ----------
+# ---------- map slugs to display text & enumerate all labels ----------
 def _label_slug_to_text_map(comp0_path: Path) -> Dict[str, str]:
     """
     Build a mapping from slug -> human-readable text from inputs/components_0.json.
@@ -173,7 +173,7 @@ def _get_object_name(x_id: str) -> str:
     return name or "object"
 
 
-# ---- new: ensure minimum image size to avoid 1-pixel dims ambiguity ----
+# ---- ensure minimum image size to avoid 1-pixel dims ambiguity ----
 def _ensure_min_size(img: Image.Image, min_size: int = 2) -> Image.Image:
     """
     Ensure the image is at least min_size x min_size by padding on a white canvas.
@@ -234,26 +234,11 @@ def _crop_box_image(ctrl_img: np.ndarray, box: Tuple[float, float, float, float]
     return _ensure_min_size(Image.fromarray(ctrl_img[y1:y2, x1:x2, :]))
 
 
-# ----------------- CLIP helpers -----------------
+# ----------------- CLIP helpers (text only) -----------------
 def _prepare_clip():
     model = CLIPModel.from_pretrained(CLIP_MODEL_ID).to(DEVICE)
     processor = CLIPProcessor.from_pretrained(CLIP_MODEL_ID)
     return model, processor
-
-
-def _encode_image(model, processor, img: Image.Image) -> np.ndarray:
-    # Ensure valid size & explicit channels-last format to avoid ambiguity.
-    img = _ensure_min_size(img.convert("RGB"), min_size=2)
-    inputs = processor(
-        images=img,
-        return_tensors="pt",
-        input_data_format="channels_last"  # disambiguate degenerate shapes
-    ).to(DEVICE)
-    with torch.no_grad():
-        feats = model.get_image_features(**inputs)
-    v = feats[0].detach().cpu().numpy().astype(np.float32)
-    n = np.linalg.norm(v) + 1e-8
-    return v / n
 
 
 def _encode_text(model, processor, text: str) -> np.ndarray:
@@ -265,10 +250,52 @@ def _encode_text(model, processor, text: str) -> np.ndarray:
     return v / n
 
 
+# ----------------- DINOv2 helpers (image embeddings) -----------------
+def _prepare_dinov2():
+    """
+    Load DINOv2 ViT-B/14 and its preprocessing transform.
+    Requires: torch.hub to access facebookresearch/dinov2.
+    """
+    import torchvision.transforms as T
+
+    model = torch.hub.load("facebookresearch/dinov2", "dinov2_vitb14")
+    model.to(DEVICE)
+    model.eval()
+
+    transform = T.Compose([
+        T.Resize(256, interpolation=Image.BICUBIC),
+        T.CenterCrop(224),
+        T.ToTensor(),
+        T.Normalize(
+            mean=(0.485, 0.456, 0.406),
+            std=(0.229, 0.224, 0.225),
+        ),
+    ])
+    return model, transform
+
+
+def _encode_image_dino(model, transform, img: Image.Image) -> np.ndarray:
+    """
+    Encode an image into a DINOv2 embedding.
+    """
+    img = _ensure_min_size(img.convert("RGB"), min_size=2)
+    x = transform(img).unsqueeze(0).to(DEVICE)  # (1, 3, H, W)
+    with torch.no_grad():
+        feats = model(x)  # (1, D) for DINOv2 hub models
+    v = feats[0].detach().cpu().numpy().astype(np.float32)
+    n = np.linalg.norm(v) + 1e-8
+    return v / n
+
+
 # ----------------- main -----------------
 def main():
     ref_labels = _determine_reference_labels()  # list[(slug, text)]
-    model, processor = _prepare_clip()
+
+    # CLIP for text embeddings
+    clip_model, clip_processor = _prepare_clip()
+
+    # DINOv2 for image embeddings
+    dino_model, dino_transform = _prepare_dinov2()
 
     for x_dir in sorted(OUTPUTS_DIR.iterdir()):
         if not x_dir.is_dir():
@@ -276,10 +303,17 @@ def main():
         x_id = x_dir.name
 
         sketch_path = INPUTS_DIR / f"{x_id}.png"
-        sketch_img = np.array(Image.open(sketch_path).convert("RGB"))
-        realism_dir = x_dir / "realism_imgs"
-        if not sketch_path.exists() or not realism_dir.exists():
+        if not sketch_path.exists():
             continue
+        sketch_img = np.array(Image.open(sketch_path).convert("RGB"))
+
+        realism_dir = x_dir / "realism_imgs"
+        if not realism_dir.exists():
+            continue
+
+        # embedded_items folder at outputs/x/embedded_items
+        embedded_items_dir = x_dir / "embedded_items"
+        embedded_items_dir.mkdir(parents=True, exist_ok=True)
 
         for ref_label_slug, ref_label_text in ref_labels:
             fragments_dir = x_dir / "fragments" / ref_label_slug
@@ -287,7 +321,9 @@ def main():
                 # label not present for this x_id → skip
                 continue
 
-            overlay_paths = sorted(fragments_dir.glob(f"{ref_label_slug}_frag_*_overlay.png"))
+            overlay_paths = sorted(
+                fragments_dir.glob(f"{ref_label_slug}_frag_*_overlay.png")
+            )
             if not overlay_paths:
                 continue
 
@@ -370,18 +406,18 @@ def main():
                     continue
                 ctrl_img = np.array(Image.open(ctrl_img_path).convert("RGB"))
 
-                # 1) emb_mask
+                # 1) img_mask and emb_mask (DINOv2)
                 img_mask = _mask_ctrl_fragment_image(sketch_img, frag_mask)
-                emb_mask = _encode_image(model, processor, img_mask)
+                emb_mask = _encode_image_dino(dino_model, dino_transform, img_mask)
 
-                # 2) emb_box
+                # 2) img_box and emb_box (DINOv2)
                 img_box = _crop_box_image(sketch_img, box)
-                emb_box = _encode_image(model, processor, img_box)
+                emb_box = _encode_image_dino(dino_model, dino_transform, img_box)
 
-                # 3) emb_text
-                emb_text = _encode_text(model, processor, text_for_x)
+                # 3) emb_text (CLIP)
+                emb_text = _encode_text(clip_model, clip_processor, text_for_x)
 
-                # save npz
+                # save npz (per-label folder)
                 out_path = emb_dir / f"{ref_label_slug}_frag_{frag_idx}_embed.npz"
                 meta = {
                     "x_id": x_id,
@@ -400,7 +436,17 @@ def main():
                     meta=json.dumps(meta),
                 )
 
-                print(f"[x={x_id} | {ref_label_slug}] frag {frag_idx}: saved -> {out_path.name}")
+                # save debug images to embedded_items (for visual inspection)
+                debug_mask_path = embedded_items_dir / f"{ref_label_slug}_frag_{frag_idx}_mask.png"
+                debug_box_path = embedded_items_dir / f"{ref_label_slug}_frag_{frag_idx}_box.png"
+                img_mask.save(debug_mask_path)
+                img_box.save(debug_box_path)
+
+                print(
+                    f"[x={x_id} | {ref_label_slug}] frag {frag_idx}: "
+                    f"saved embeddings -> {out_path.name}, "
+                    f"debug imgs -> {debug_mask_path.name}, {debug_box_path.name}"
+                )
 
 
 if __name__ == "__main__":
