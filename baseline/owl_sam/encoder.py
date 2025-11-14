@@ -407,11 +407,12 @@ def main():
                 ctrl_img = np.array(Image.open(ctrl_img_path).convert("RGB"))
 
                 # 1) img_mask and emb_mask (DINOv2)
-                img_mask = _mask_ctrl_fragment_image(sketch_img, frag_mask)
+                # img_mask = _mask_ctrl_fragment_image(sketch_img, frag_mask)
+                img_mask = _mask_ctrl_fragment_image(ctrl_img, frag_mask)
                 emb_mask = _encode_image_dino(dino_model, dino_transform, img_mask)
 
                 # 2) img_box and emb_box (DINOv2)
-                img_box = _crop_box_image(sketch_img, box)
+                img_box = _crop_box_image(ctrl_img, box)
                 emb_box = _encode_image_dino(dino_model, dino_transform, img_box)
 
                 # 3) emb_text (CLIP)
