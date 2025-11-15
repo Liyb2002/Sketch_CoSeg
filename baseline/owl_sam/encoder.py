@@ -6,6 +6,8 @@ from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 from PIL import Image
+import gc  # <--- NEW
+import shutil
 
 import torch
 from transformers import CLIPProcessor, CLIPModel
@@ -16,6 +18,7 @@ OUTPUTS_DIR = Path("outputs")
 DIFF_THRESH = 12  # threshold to detect fragment from overlay
 CLIP_MODEL_ID = "openai/clip-vit-base-patch32"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+FRAG_GC_INTERVAL = 20  # <--- NEW: how many fragments before clearing CUDA cache
 
 random.seed(0)  # reproducible ctrl_* choice
 
@@ -297,10 +300,25 @@ def main():
     # DINOv2 for image embeddings
     dino_model, dino_transform = _prepare_dinov2()
 
+    frags_since_gc = 0  # fragment counter for CUDA cache flushing
+
     for x_dir in sorted(OUTPUTS_DIR.iterdir()):
         if not x_dir.is_dir():
             continue
         x_id = x_dir.name
+
+        # ---------------- CLEAN OUTPUT DIRS FOR THIS x_id ----------------
+        embedded_items_dir = x_dir / "embedded_items"
+        embeddings_root = x_dir / "embeddings"
+
+        if embedded_items_dir.exists():
+            shutil.rmtree(embedded_items_dir)
+        if embeddings_root.exists():
+            shutil.rmtree(embeddings_root)
+
+        embedded_items_dir.mkdir(parents=True, exist_ok=True)
+        embeddings_root.mkdir(parents=True, exist_ok=True)
+        # -----------------------------------------------------------------
 
         sketch_path = INPUTS_DIR / f"{x_id}.png"
         if not sketch_path.exists():
@@ -311,9 +329,12 @@ def main():
         if not realism_dir.exists():
             continue
 
-        # embedded_items folder at outputs/x/embedded_items
-        embedded_items_dir = x_dir / "embedded_items"
-        embedded_items_dir.mkdir(parents=True, exist_ok=True)
+        object_name = _get_object_name(x_id)
+
+        # all ctrl_* dirs for this x_id
+        ctrl_dirs = [d for d in sorted(x_dir.glob("ctrl_*")) if d.is_dir()]
+        if not ctrl_dirs:
+            continue
 
         for ref_label_slug, ref_label_text in ref_labels:
             fragments_dir = x_dir / "fragments" / ref_label_slug
@@ -327,127 +348,200 @@ def main():
             if not overlay_paths:
                 continue
 
-            # embeddings output folder
-            emb_dir = x_dir / "embeddings" / ref_label_slug
+            # embeddings output folder for this label
+            emb_dir = embeddings_root / ref_label_slug
             emb_dir.mkdir(parents=True, exist_ok=True)
 
-            object_name = _get_object_name(x_id)
             text_for_x = f"{ref_label_text} of a {object_name}"
+            # precompute text embedding once per x/label
+            emb_text = _encode_text(clip_model, clip_processor, text_for_x)
 
             for overlay_path in overlay_paths:
-                # parse fragment index
-                stem = overlay_path.stem  # {slug}_frag_k_overlay
+                # parse fragment index: {slug}_frag_k_overlay.png
+                stem = overlay_path.stem
                 try:
                     frag_idx_part = stem.split("_frag_")[1]
                     frag_idx = int(frag_idx_part.split("_")[0])
                 except Exception:
                     frag_idx = -1
 
-                # fragment mask
+                # fragment mask (in sketch space)
                 frag_mask = _reconstruct_fragment_mask_full(overlay_path, sketch_path)
                 if frag_mask.sum() == 0:
                     continue
 
-                # sample points
+                # sample points used to check box/OWL alignment
                 sample_points = _sample_points_from_mask(frag_mask, k=3)
                 if not sample_points:
                     continue
 
-                # find ALL contributing ctrl_* and remember the matching box
-                contrib: Dict[str, Tuple[float, float, float, float]] = {}
-
-                for ctrl_dir in sorted(x_dir.glob("ctrl_*")):
-                    if not ctrl_dir.is_dir():
-                        continue
+                # -------------------------------------------------
+                # 1) Scan all ctrl_*: which ones choose this fragment?
+                # -------------------------------------------------
+                ctrl_infos = []  # {ctrl_name, matched, box}
+                for ctrl_dir in ctrl_dirs:
+                    ctrl_name = ctrl_dir.name
 
                     owl_path = ctrl_dir / "owl_results.json"
                     if not owl_path.exists():
                         owl_path = ctrl_dir / "owl_boxes.json"
-                    if not owl_path.exists():
-                        continue
 
-                    boxes_data = _load_owl_boxes(owl_path)
-                    if not boxes_data:
-                        continue
+                    boxes_data = _load_owl_boxes(owl_path) if owl_path.exists() else {}
 
-                    keys = [
-                        ref_label_text,
-                        ref_label_slug,
-                        ref_label_text.lower(),
-                        ref_label_slug.lower(),
-                    ]
-                    all_boxes = []
-                    for k in keys:
-                        if k in boxes_data:
-                            b = boxes_data[k]["boxes"]
-                            if b.size > 0:
-                                all_boxes.append(b)
-                    if not all_boxes:
-                        continue
-                    all_boxes = np.concatenate(all_boxes, axis=0)
+                    matched = False
+                    box_for_frag = None
 
-                    for b in all_boxes:
-                        x1, y1, x2, y2 = map(float, b.tolist())
-                        if _points_inside_box(sample_points, (x1, y1, x2, y2)):
-                            contrib[ctrl_dir.name] = (x1, y1, x2, y2)
-                            break  # one good box per ctrl is enough
+                    if boxes_data:
+                        keys = [
+                            ref_label_text,
+                            ref_label_slug,
+                            ref_label_text.lower(),
+                            ref_label_slug.lower(),
+                        ]
+                        all_boxes = []
+                        for k in keys:
+                            if k in boxes_data:
+                                b = boxes_data[k]["boxes"]
+                                if b.size > 0:
+                                    all_boxes.append(b)
+                        if all_boxes:
+                            all_boxes = np.concatenate(all_boxes, axis=0)
+                            for b in all_boxes:
+                                x1, y1, x2, y2 = map(float, b.tolist())
+                                if _points_inside_box(sample_points, (x1, y1, x2, y2)):
+                                    matched = True
+                                    box_for_frag = (x1, y1, x2, y2)
+                                    break
 
-                if not contrib:
-                    # no ctrl supports this fragment → skip embedding
+                    ctrl_infos.append(
+                        {
+                            "ctrl_name": ctrl_name,
+                            "matched": matched,
+                            "box": box_for_frag,
+                        }
+                    )
+
+                if not ctrl_infos:
                     continue
 
-                # pick one ctrl_* at random and get its box
-                ctrl_name = random.choice(list(contrib.keys()))
-                box = contrib[ctrl_name]
+                chosen_infos = [ci for ci in ctrl_infos if ci["matched"]]
+                unchosen_infos = [ci for ci in ctrl_infos if not ci["matched"]]
 
-                # load ctrl image
-                ctrl_img_path = realism_dir / f"{ctrl_name}.png"
-                if not ctrl_img_path.exists():
-                    continue
-                ctrl_img = np.array(Image.open(ctrl_img_path).convert("RGB"))
+                # -------------------------------------------------
+                # 2) Select 3 ctrl images for overlays:
+                #    - ensure at least 1 chosen if possible
+                #    - remaining 2 are random from all ctrl's
+                # -------------------------------------------------
+                if chosen_infos:
+                    # pick 1 chosen
+                    first = random.choice(chosen_infos)
+                    # pick 2 more random from the rest (can be chosen or unchosen)
+                    remaining = [ci for ci in ctrl_infos if ci is not first]
+                    selected_infos = [first] + random.sample(remaining, 2)
+                else:
+                    # no chosen at all → just pick 3 random
+                    selected_infos = random.sample(ctrl_infos, 3)
 
-                # 1) img_mask and emb_mask (DINOv2)
-                # img_mask = _mask_ctrl_fragment_image(sketch_img, frag_mask)
-                img_mask = _mask_ctrl_fragment_image(ctrl_img, frag_mask)
-                emb_mask = _encode_image_dino(dino_model, dino_transform, img_mask)
+                # -------------------------------------------------
+                # 3) Determine reference bounding box:
+                #    - from a chosen image if any exist
+                #    - else: fall back to full-image box later
+                # -------------------------------------------------
+                ref_box = None
+                ref_box_source = None
 
-                # 2) img_box and emb_box (DINOv2)
-                img_box = _crop_box_image(ctrl_img, box)
-                emb_box = _encode_image_dino(dino_model, dino_transform, img_box)
+                if chosen_infos:
+                    chosen_with_box = [ci for ci in chosen_infos if ci["box"] is not None]
+                    if chosen_with_box:
+                        ci_ref = random.choice(chosen_with_box)
+                        ref_box = ci_ref["box"]
+                        ref_box_source = ci_ref["ctrl_name"]
 
-                # 3) emb_text (CLIP)
-                emb_text = _encode_text(clip_model, clip_processor, text_for_x)
+                # -------------------------------------------------
+                # 4) For each selected ctrl, compute mask+box embeddings
+                # -------------------------------------------------
+                for ci in selected_infos:
+                    ctrl_name = ci["ctrl_name"]
 
-                # save npz (per-label folder)
-                out_path = emb_dir / f"{ref_label_slug}_frag_{frag_idx}_embed.npz"
-                meta = {
-                    "x_id": x_id,
-                    "label": ref_label_text,
-                    "label_slug": ref_label_slug,
-                    "frag_index": frag_idx,
-                    "ctrl_name": ctrl_name,
-                    "box": [int(v) for v in box],
-                    "text": text_for_x,
-                }
-                np.savez_compressed(
-                    out_path,
-                    emb_mask=emb_mask,
-                    emb_box=emb_box,
-                    emb_text=emb_text,
-                    meta=json.dumps(meta),
-                )
+                    ctrl_img_path = realism_dir / f"{ctrl_name}.png"
+                    if not ctrl_img_path.exists():
+                        continue
+                    ctrl_img = np.array(Image.open(ctrl_img_path).convert("RGB"))
 
-                # save debug images to embedded_items (for visual inspection)
-                debug_mask_path = embedded_items_dir / f"{ref_label_slug}_frag_{frag_idx}_mask.png"
-                debug_box_path = embedded_items_dir / f"{ref_label_slug}_frag_{frag_idx}_box.png"
-                img_mask.save(debug_mask_path)
-                img_box.save(debug_box_path)
+                    # mask embedding on THIS ctrl image (always)
+                    img_mask = _mask_ctrl_fragment_image(ctrl_img, frag_mask)
+                    emb_mask = _encode_image_dino(dino_model, dino_transform, img_mask)
 
-                print(
-                    f"[x={x_id} | {ref_label_slug}] frag {frag_idx}: "
-                    f"saved embeddings -> {out_path.name}, "
-                    f"debug imgs -> {debug_mask_path.name}, {debug_box_path.name}"
-                )
+                    # box embedding:
+                    #  - if ref_box exists (from any chosen), use it
+                    #  - otherwise (no chosen anywhere), full-image box
+                    if ref_box is not None:
+                        box = ref_box
+                        matched_box = True
+                    else:
+                        h, w = ctrl_img.shape[:2]
+                        box = (0.0, 0.0, float(w), float(h))
+                        matched_box = False
+                        ref_box_source = None
+
+                    img_box = _crop_box_image(ctrl_img, box)
+                    emb_box = _encode_image_dino(dino_model, dino_transform, img_box)
+
+                    meta = {
+                        "x_id": x_id,
+                        "label": ref_label_text,
+                        "label_slug": ref_label_slug,
+                        "frag_index": frag_idx,
+                        "ctrl_name": ctrl_name,
+                        "box": [int(v) for v in box],
+                        "text": text_for_x,          # plain text for emb_text
+                        "matched_box": matched_box,  # True iff box came from OWL
+                        "ref_box_source": ref_box_source,
+                    }
+
+                    out_path = (
+                        emb_dir
+                        / f"{ref_label_slug}_frag_{frag_idx}_{ctrl_name}_embed.npz"
+                    )
+
+                    np.savez_compressed(
+                        out_path,
+                        emb_mask=emb_mask,
+                        emb_box=emb_box,
+                        emb_text=emb_text,
+                        meta=json.dumps(meta),
+                    )
+
+                    # debug images
+                    debug_mask_path = (
+                        embedded_items_dir
+                        / f"{ref_label_slug}_frag_{frag_idx}_{ctrl_name}_mask.png"
+                    )
+                    debug_box_path = (
+                        embedded_items_dir
+                        / f"{ref_label_slug}_frag_{frag_idx}_{ctrl_name}_box.png"
+                    )
+                    img_mask.save(debug_mask_path)
+                    img_box.save(debug_box_path)
+
+                    # free per-ctrl stuff
+                    del ctrl_img, img_mask, img_box, emb_mask, emb_box
+
+                    print(
+                        f"[x={x_id} | {ref_label_slug} | {ctrl_name}] frag {frag_idx}: "
+                        f"saved embeddings -> {out_path.name}, "
+                        f"debug imgs -> {debug_mask_path.name}, {debug_box_path.name}"
+                    )
+
+                # -------- fragment-level cleanup / CUDA cache flush --------
+                frags_since_gc += 1
+                if DEVICE.type == "cuda" and frags_since_gc >= FRAG_GC_INTERVAL:
+                    torch.cuda.empty_cache()
+                    gc.collect()
+                    frags_since_gc = 0
+                    print(
+                        f"[INFO] Cleared CUDA cache after {FRAG_GC_INTERVAL} fragments."
+                    )
 
 
 if __name__ == "__main__":

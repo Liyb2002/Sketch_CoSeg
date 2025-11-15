@@ -1,43 +1,95 @@
 # coseg/losses.py
 
-import torch, torch.nn.functional as F
+from typing import List, Tuple
 
-def second_singular_value(M):
-    sv = torch.linalg.svdvals(M)
-    return sv[1] if sv.numel() >= 2 else torch.tensor(0., device=M.device)
+import torch
 
-def build_part_matrices(Y, A, img_ids, K):
-    device = Y.device
-    M = int(img_ids.max().item() + 1)
-    d = Y.size(1)
-    Ms = []
-    for k in range(K):
-        rows = []
-        for i in range(M):
-            mask = (img_ids == i)
-            Yi = Y[mask]
-            Ai = A[mask, k:k+1]
-            if Yi.numel() == 0:
-                rows.append(torch.zeros(d, device=device))
+
+def coseg_cluster_loss(
+    h_by_shape: List[torch.Tensor],
+    labels_by_shape: List[torch.Tensor],
+    num_labels: int,
+    lambda_intra: float = 1.0,
+    lambda_inter: float = 0.1,
+    margin: float = 1.0,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Clustering-style co-seg loss in the learned feature space:
+
+        1) Intra-label compactness:
+           - fragments in the same label should be close to their label centroid.
+
+        2) Inter-label separation:
+           - label centroids should be at least `margin` apart (hinge).
+
+    Args:
+        h_by_shape: list of (Mi, F) tensors, co-seg features per sketch.
+        labels_by_shape: list of (Mi,) int tensors with values in [0, num_labels-1].
+                         This includes the 'empty' label as one of the indices (even if unused).
+        num_labels: total number of labels, including the empty label (n+1).
+        lambda_intra: weight for the intra-label term (usually larger).
+        lambda_inter: weight for the inter-label term (usually smaller).
+        margin: desired minimum distance between label centroids.
+
+    Returns:
+        total_loss, intra_loss, inter_loss
+    """
+    device = h_by_shape[0].device
+
+    # Flatten across all shapes: H_all: (N, F), y_all: (N,)
+    H_all = torch.cat(h_by_shape, dim=0)          # (N, F)
+    y_all = torch.cat(labels_by_shape, dim=0)     # (N,)
+
+    # ----- compute centroids -----
+    centroids = []
+    for k in range(num_labels):
+        mask_k = (y_all == k)
+        if mask_k.any():
+            c_k = H_all[mask_k].mean(dim=0)       # (F,)
+            centroids.append(c_k)
+        else:
+            centroids.append(None)
+
+    # ----- intra-label compactness -----
+    intra_loss = torch.zeros((), device=device)
+    intra_count = 0
+
+    for k in range(num_labels):
+        if centroids[k] is None:
+            continue
+        mask_k = (y_all == k)
+        if mask_k.sum() == 0:
+            continue
+        diffs = H_all[mask_k] - centroids[k]      # (Nk, F)
+        # mean squared distance within this label
+        label_loss = (diffs.pow(2).sum(dim=1)).mean()
+        intra_loss = intra_loss + label_loss
+        intra_count += 1
+
+    if intra_count > 0:
+        intra_loss = intra_loss / intra_count
+
+    # ----- inter-label separation (centroid margin loss) -----
+    inter_loss = torch.zeros((), device=device)
+    inter_count = 0
+
+    # collect indices of labels that actually appear
+    active_labels = [k for k in range(num_labels) if centroids[k] is not None]
+
+    for i_idx, k in enumerate(active_labels):
+        for l in active_labels[i_idx + 1 :]:
+            ck = centroids[k]
+            cl = centroids[l]
+            if ck is None or cl is None:
                 continue
-            wsum = Ai.sum().clamp_min(1e-6)
-            vk = (Ai.T @ Yi) / wsum
-            rows.append(F.normalize(vk.squeeze(0), dim=0))
-        Mk = torch.stack(rows, dim=0)
-        Ms.append(Mk)
-    return Ms
+            dist = torch.norm(ck - cl, p=2)
+            # hinge: penalize if too close
+            penalty = torch.relu(margin - dist).pow(2)
+            inter_loss = inter_loss + penalty
+            inter_count += 1
 
-def rank_consistency_loss(Ms, lambda_between=0.2):
-    # Lrank = sum_k σ2(Mk) - λ * sum_{k<l} σ2([Mk; Ml])
-    K = len(Ms)
-    loss_in = sum(second_singular_value(Mk) for Mk in Ms)
-    loss_bt = 0.0
-    for k in range(K):
-        for l in range(k+1, K):
-            loss_bt = loss_bt + second_singular_value(torch.cat([Ms[k], Ms[l]], dim=0))
-    return loss_in - lambda_between * loss_bt
+    if inter_count > 0:
+        inter_loss = inter_loss / inter_count
 
-# ---- NEW: rank-only total ----
-def total_loss_rank_only(Ms, lambda_between=0.2):
-    Lrank = rank_consistency_loss(Ms, lambda_between=lambda_between)
-    return Lrank, {"Lrank": Lrank.detach()}
+    total_loss = lambda_intra * intra_loss + lambda_inter * inter_loss
+    return total_loss, intra_loss, inter_loss
